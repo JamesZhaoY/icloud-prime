@@ -27,6 +27,7 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8081", "HTTP 监听地址")
 	apiToken := flag.String("api-token", os.Getenv("ICLOUD_PRIME_API_TOKEN"), "API 访问令牌 (远程监听时必填)")
+	publicURL := flag.String("public-url", os.Getenv("ICLOUD_PRIME_PUBLIC_URL"), "公开访问地址 (用于生成绝对取件 URL)")
 	dataDir := flag.String("data", "./data", "数据目录 (accounts.json 存放位置)")
 	debug := flag.Bool("debug", false, "调试模式 (启用 Gin 调试日志)")
 	flag.Parse()
@@ -47,6 +48,12 @@ func main() {
 
 	srv := server.New(mgr, *debug, abs)
 	srv.SetAPIToken(*apiToken)
+	if err := srv.OpenPickupStore(abs); err != nil {
+		log.Fatalf("初始化取件链接失败: %v", err)
+	}
+	if err := srv.SetPublicURL(*publicURL); err != nil {
+		log.Fatal(err)
+	}
 
 	log.Printf("HTTP 服务就绪 addr=%s", *addr)
 	if err := srv.Run(*addr); err != nil {

@@ -14,9 +14,12 @@ import (
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
+	"net/textproto"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,6 +65,8 @@ type Client struct {
 	appleID     string
 	appPassword string
 	cli         *client.Client
+	raw         net.Conn
+	pool        *Pool
 }
 
 // NewClient 创建 IMAP 客户端。需在调用其它方法前先 Connect。
@@ -69,27 +74,77 @@ func NewClient(appleID, appPassword string) *Client {
 	return &Client{appleID: appleID, appPassword: appPassword}
 }
 
-// Connect 连接并登录 IMAP 服务器。
-func (c *Client) Connect() error {
-	addr := fmt.Sprintf("%s:%d", IMAPServer, IMAPPort)
-	cli, err := client.DialTLS(addr, nil)
+// NewPooledClient 创建从连接池借用连接的客户端。Disconnect 会把连接还回池中。
+func NewPooledClient(appleID, appPassword string, pool *Pool) *Client {
+	return &Client{appleID: appleID, appPassword: appPassword, pool: pool}
+}
+
+// captureDialer 记录底层 TCP 连接,供连接池清除读超时。
+type captureDialer struct {
+	timeout time.Duration
+	conn    net.Conn
+}
+
+func (d *captureDialer) Dial(network, addr string) (net.Conn, error) {
+	conn, err := (&net.Dialer{Timeout: d.timeout}).Dial(network, addr)
 	if err != nil {
-		return fmt.Errorf("IMAP 连接失败: %w", err)
+		return nil, err
 	}
-	if err := cli.Login(c.appleID, c.appPassword); err != nil {
+	// DialWithDialerTLS 只对 *net.Dialer 设置握手和问候超时,这里自己补上。
+	if err := conn.SetDeadline(time.Now().Add(d.timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	d.conn = conn
+	return conn, nil
+}
+
+func dialIMAP(appleID, appPassword string) (*client.Client, net.Conn, error) {
+	addr := fmt.Sprintf("%s:%d", IMAPServer, IMAPPort)
+	dialer := &captureDialer{timeout: 10 * time.Second}
+	cli, err := client.DialWithDialerTLS(dialer, addr, nil)
+	if err != nil {
+		if dialer.conn != nil {
+			dialer.conn.Close()
+		}
+		return nil, nil, fmt.Errorf("IMAP 连接失败: %w", err)
+	}
+	cli.Timeout = 20 * time.Second
+	if err := cli.Login(appleID, appPassword); err != nil {
 		_ = cli.Terminate()
-		return fmt.Errorf("IMAP 登录失败 — 请检查: 1) 应用专用密码是否正确 2) Apple ID: %s — %w", c.appleID, err)
+		return nil, nil, fmt.Errorf("IMAP 登录失败 — 请检查: 1) 应用专用密码是否正确 2) Apple ID: %s — %w", appleID, err)
 	}
-	c.cli = cli
+	return cli, dialer.conn, nil
+}
+
+// Connect 连接并登录 IMAP 服务器;使用连接池时优先复用空闲连接。
+func (c *Client) Connect() error {
+	var cli *client.Client
+	var raw net.Conn
+	var err error
+	if c.pool != nil {
+		cli, raw, err = c.pool.get(c.appleID, c.appPassword)
+	} else {
+		cli, raw, err = dialIMAP(c.appleID, c.appPassword)
+	}
+	if err != nil {
+		return err
+	}
+	c.cli, c.raw = cli, raw
 	return nil
 }
 
-// Disconnect 登出并关闭连接。
+// Disconnect 释放连接:使用连接池时归还,否则登出并关闭。
 func (c *Client) Disconnect() {
-	if c.cli != nil {
-		_ = c.cli.Logout()
-		c.cli = nil
+	if c.cli == nil {
+		return
 	}
+	if c.pool != nil {
+		c.pool.put(c.appleID, c.appPassword, c.cli, c.raw)
+	} else {
+		_ = c.cli.Logout()
+	}
+	c.cli, c.raw = nil, nil
 }
 
 // InboxCount 返回收件箱邮件总数。
@@ -344,6 +399,136 @@ func (c *Client) searchRecipientUIDs(recipient string, days int) ([]uint32, erro
 	return nil, lastErr
 }
 
+var pickupRecipientHeaders = []string{"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "X-Apple-HME"}
+
+const applePickupHeader = "X-iCloud-HME"
+
+var ErrPickupNeedsIMAP = errors.New("IMAP is required to verify individual pickup messages")
+
+func (c *Client) PickupByRecipient(recipient string, limit, days int, includeBody bool) ([]Message, error) {
+	if c.cli == nil {
+		return nil, fmt.Errorf("未连接")
+	}
+	messages := make([]Message, 0, limit)
+	for _, folder := range []string{"INBOX", "Junk"} {
+		matches, err := c.pickupInFolder(folder, recipient, limit, days, includeBody)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", folder, err)
+		}
+		messages = append(messages, matches...)
+	}
+	sortMessages(messages)
+	return messages[:min(len(messages), limit)], nil
+}
+
+func (c *Client) pickupInFolder(folder, recipient string, limit, days int, includeBody bool) ([]Message, error) {
+	mailbox, err := c.cli.Select(folder, true)
+	if err != nil {
+		return nil, err
+	}
+	if mailbox.Messages == 0 {
+		return nil, nil
+	}
+	to := imap.NewSearchCriteria()
+	to.Header.Add("To", recipient)
+	forwarded := imap.NewSearchCriteria()
+	forwarded.Header.Add(applePickupHeader, recipient)
+	since := time.Now().AddDate(0, 0, -days)
+	search := &imap.SearchCriteria{Since: since, Or: [][2]*imap.SearchCriteria{{to, forwarded}}}
+	uids, err := c.cli.UidSearch(search)
+	if err == nil && len(uids) > 0 {
+		sort.Slice(uids, func(left, right int) bool { return uids[left] < uids[right] })
+		if allowed := limit * 3; len(uids) > allowed {
+			uids = uids[len(uids)-allowed:]
+		}
+		seqset := new(imap.SeqSet)
+		seqset.AddNum(uids...)
+		matches, err := c.fetchPickup(c.cli.UidFetch, seqset, folder, recipient, since, includeBody)
+		if err != nil || len(matches) > 0 {
+			return matches, err
+		}
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddRange(mailbox.Messages-min(mailbox.Messages, 90)+1, mailbox.Messages)
+	matches, err := c.fetchPickup(c.cli.Fetch, seqset, folder, recipient, since, false)
+	if err != nil || !includeBody || len(matches) == 0 {
+		return matches, err
+	}
+	sortMessages(matches)
+	uidsToRead := new(imap.SeqSet)
+	for _, message := range matches[:min(len(matches), limit)] {
+		uid, err := strconv.ParseUint(message.UID, 10, 32)
+		if err == nil && uid != 0 {
+			uidsToRead.AddNum(uint32(uid))
+		}
+	}
+	if uidsToRead.Empty() {
+		return matches, nil
+	}
+	return c.fetchPickup(c.cli.UidFetch, uidsToRead, folder, recipient, since, true)
+}
+
+func (c *Client) fetchPickup(fetch func(*imap.SeqSet, []imap.FetchItem, chan *imap.Message) error, seqset *imap.SeqSet, folder, recipient string, since time.Time, includeBody bool) ([]Message, error) {
+	section := &imap.BodySectionName{Peek: true}
+	if !includeBody {
+		section.Specifier = imap.HeaderSpecifier
+		section.Fields = append(append([]string(nil), pickupRecipientHeaders...), applePickupHeader)
+	}
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
+	stream := make(chan *imap.Message, 16)
+	done := make(chan error, 1)
+	go func() { done <- fetch(seqset, items, stream) }()
+	var messages []Message
+	for item := range stream {
+		if !item.InternalDate.IsZero() && item.InternalDate.Before(since) {
+			continue
+		}
+		payload := item.GetBody(section)
+		if payload == nil {
+			continue
+		}
+		parsed, err := mail.ReadMessage(payload)
+		if err != nil || !pickupRecipientMatches(parsed.Header, recipient) {
+			continue
+		}
+		message := toMessageSummary(item, folder)
+		if includeBody {
+			if body, err := readBody(parsed); err == nil {
+				message.Preview = strings.TrimSpace(body)
+			}
+		}
+		messages = append(messages, message)
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func pickupRecipientMatches(headers mail.Header, recipient string) bool {
+	for _, value := range textproto.MIMEHeader(headers).Values(applePickupHeader) {
+		field, _, _ := strings.Cut(value, ";")
+		address, ok := strings.CutPrefix(strings.TrimSpace(field), "p=")
+		if ok && strings.EqualFold(strings.TrimSpace(address), recipient) {
+			return true
+		}
+	}
+	for _, name := range pickupRecipientHeaders {
+		for _, value := range textproto.MIMEHeader(headers).Values(name) {
+			addresses, err := mail.ParseAddressList(value)
+			if err != nil {
+				continue
+			}
+			for _, address := range addresses {
+				if strings.EqualFold(address.Address, recipient) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (c *Client) fetchByUIDs(uids []uint32, folder string, limit int, includeBody bool) ([]Message, error) {
 	if len(uids) == 0 {
 		return []Message{}, nil
@@ -484,7 +669,7 @@ func toMessage(msg *imap.Message, folder string) Message {
 		}
 		m.Subject = decodeHeader(msg.Envelope.Subject)
 		if !msg.Envelope.Date.IsZero() {
-			m.Date = msg.Envelope.Date.Format(time.RFC3339)
+			m.Date = FormatMessageTime(msg.Envelope.Date)
 		}
 	}
 	if m.From != "" {
@@ -494,7 +679,7 @@ func toMessage(msg *imap.Message, folder string) Message {
 		m.To = decodeHeader(m.To)
 	}
 	if m.Date == "" && !msg.InternalDate.IsZero() {
-		m.Date = msg.InternalDate.Format(time.RFC3339)
+		m.Date = FormatMessageTime(msg.InternalDate)
 	}
 	return m
 }
@@ -669,6 +854,26 @@ func olderThanDays(value string, days int) bool {
 		return false
 	}
 	return time.Since(t) > time.Duration(days)*24*time.Hour
+}
+
+// MessageZone 是邮件时间统一使用的时区(UTC+8,北京时间,无夏令时)。
+// 用固定偏移而不是 Asia/Shanghai,不依赖容器里的 tzdata。
+var MessageZone = time.FixedZone("UTC+8", 8*60*60)
+
+// FormatMessageTime 把邮件时间换算到 UTC+8,输出 RFC3339(例如 2026-11-25T15:52:32+08:00)。
+// 发件人头里的时区、IMAP 服务器时区和容器的 UTC 各不相同,统一后 API 和页面显示一致。
+func FormatMessageTime(t time.Time) string {
+	return t.In(MessageZone).Format(time.RFC3339)
+}
+
+// DisplayMessageTime 把 RFC3339 等格式的邮件时间显示为 "2006-01-02 15:04:05"(UTC+8)。
+// 无法解析时原样返回。
+func DisplayMessageTime(value string) string {
+	t, err := parseMessageDate(value)
+	if err != nil {
+		return value
+	}
+	return t.In(MessageZone).Format("2006-01-02 15:04:05")
 }
 
 func parseMessageDate(value string) (time.Time, error) {

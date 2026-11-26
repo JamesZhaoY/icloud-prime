@@ -8,6 +8,7 @@ import {
   Folder,
   Inbox,
   KeyRound,
+  Link2,
   Loader2,
   Mail,
   Pause,
@@ -47,6 +48,7 @@ type Alias = {
   label: string;
   active: boolean;
   createdAt?: string;
+  pickup_url?: string;
 };
 
 type Message = {
@@ -206,10 +208,19 @@ const authRequired = ref(false);
 const accountFormOpen = ref(false);
 const accountActionBusy = ref(false);
 const aliasActionBusy = ref(false);
-const accountForm = ref({ name: "", real_email: "", host: "icloud.com", proxy: "", cookies: "" });
-const cookieInput = ref("");
+const cookieFields = [
+  { name: "X-APPLE-WEBAUTH-TOKEN" },
+  { name: "X-APPLE-WEBAUTH-USER" },
+  { name: "X-APPLE-DS-WEB-SESSION-TOKEN" },
+  { name: "X-APPLE-WEBAUTH-HSA-TRUST", optional: true },
+  { name: "X-APPLE-WEBAUTH-PCS-Mail", optional: true },
+];
+const accountForm = ref({ name: "", real_email: "", host: "icloud.com", proxy: "", cookies: {} as Record<string, string> });
+const cookieValues = ref<Record<string, string>>({});
 const passwordForm = ref({ icloud_email: "", app_password: "" });
 const loginForm = ref({ password: "", otp_code: "" });
+// 两步式登录: 密码提交后 Apple 推送验证码, 服务端保留握手, 第二步只提交验证码。
+const loginAwaitingOtp = ref(false);
 let accountEpoch = 0;
 const requestSequences = new Map<string, number>();
 
@@ -240,9 +251,10 @@ function resetAccountData() {
   mailModalOpen.value = false;
   inboxMeta.value = { method: "", count: 0, folder: "all" };
   inboxAlias.value = "";
-  cookieInput.value = "";
+  cookieValues.value = {};
   passwordForm.value = { icloud_email: activeAccount.value?.icloud_email || "", app_password: "" };
   loginForm.value = { password: "", otp_code: "" };
+  loginAwaitingOtp.value = false;
   accountActionBusy.value = false;
   aliasActionBusy.value = false;
   for (const key of Object.keys(busy.value) as (keyof typeof busy.value)[]) busy.value[key] = false;
@@ -329,6 +341,7 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const epoch = accountEpoch;
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
+  headers.set("Accept", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(url, {
     ...init,
@@ -338,9 +351,13 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     authRequired.value = true;
     activeTab.value = "settings";
   }
-  const body = (await response.json()) as ApiResponse<T>;
-  if (!response.ok || !body.success) {
-    throw new Error(body.message || `请求失败: ${response.status}`);
+  const body = await response.json().catch(() => null) as ApiResponse<T> | null;
+  if (!response.ok || body?.success !== true) {
+    if (typeof body?.message === "string" && body.message) throw Object.assign(new Error(body.message), { status: response.status });
+    if (url.endsWith("/login") && response.status >= 500) {
+      throw new Error(`暂时无法完成 Apple ID 登录（HTTP ${response.status}）。请稍后重试，或从已登录的 iCloud 网页更新 Cookie。`);
+    }
+    throw new Error(`服务未返回有效的 API 响应（HTTP ${response.status}）。`);
   }
   return body.data as T;
 }
@@ -354,23 +371,13 @@ function clearFeedback() {
   notice.value = "";
 }
 
-function parseCookieInput(input: string): Record<string, string> {
-  const value = input.trim();
-  if (!value) throw new Error("请输入 Cookie。");
-  if (value.startsWith("{")) {
-    const parsed: unknown = JSON.parse(value);
-    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" ||
-        !Object.keys(parsed).length || Object.values(parsed).some((item) => typeof item !== "string")) {
-      throw new Error("Cookie JSON 必须是非空的字符串键值对象。");
-    }
-    return parsed as Record<string, string>;
+function collectCookies(values: Record<string, string>) {
+  const cookies: Record<string, string> = {};
+  for (const { name } of cookieFields) {
+    const value = values[name]?.trim();
+    if (value) cookies[name] = value;
   }
-  const entries = value.split(";").filter((item) => item.trim()).map((item) => {
-    const split = item.indexOf("=");
-    if (split < 1 || !item.slice(0, split).trim()) throw new Error("Cookie 格式应为 name=value。");
-    return [item.slice(0, split).trim(), item.slice(split + 1).trim()];
-  });
-  return Object.fromEntries(entries);
+  return cookies;
 }
 
 async function saveApiToken() {
@@ -391,15 +398,15 @@ async function addAccount() {
   clearFeedback();
   try {
     const form = accountForm.value;
-    if (form.cookies.trim()) parseCookieInput(form.cookies);
+    const cookies = collectCookies(form.cookies);
     const created = await api<Account>("/api/accounts", {
       method: "POST",
-      body: JSON.stringify({ ...form, name: form.name.trim(), real_email: form.real_email.trim() }),
+      body: JSON.stringify({ ...form, name: form.name.trim(), real_email: form.real_email.trim(), cookies: Object.keys(cookies).length ? JSON.stringify(cookies) : "" }),
     });
     if (!context.current()) return;
     accounts.value = [...accounts.value, created];
     selectedAccountId.value = created.id;
-    accountForm.value = { name: "", real_email: "", host: "icloud.com", proxy: "", cookies: "" };
+    accountForm.value = { name: "", real_email: "", host: "icloud.com", proxy: "", cookies: {} };
     accountFormOpen.value = false;
     await loadAccountData();
     if (selectedAccountId.value === created.id) notice.value = "账号已添加";
@@ -435,24 +442,66 @@ async function saveCredentials(kind: "cookies" | "password" | "login") {
   accountActionBusy.value = true;
   clearFeedback();
   try {
-    const body = kind === "cookies" ? { cookies: parseCookieInput(cookieInput.value) }
-      : kind === "password" ? { ...passwordForm.value } : { ...loginForm.value };
-    const result = await api<{ warning?: string }>(`/api/accounts/${encodeURIComponent(context.accountID)}/${kind}`, {
+    const body = kind === "cookies" ? { cookies: collectCookies(cookieValues.value) }
+      : kind === "password" ? { ...passwordForm.value }
+      : loginAwaitingOtp.value ? { otp_code: loginForm.value.otp_code.trim() } : { password: loginForm.value.password };
+    if (body.cookies && !Object.keys(body.cookies).length) throw new Error("请至少粘贴一个 Cookie 的值。");
+    const result = await api<{ warning?: string; needs_otp?: boolean }>(`/api/accounts/${encodeURIComponent(context.accountID)}/${kind}`, {
       method: kind === "cookies" ? "PUT" : "POST", body: JSON.stringify(body),
     });
     if (!context.current()) return;
-    cookieInput.value = "";
+    if (kind === "login" && result.needs_otp) {
+      loginForm.value = { password: "", otp_code: "" };
+      loginAwaitingOtp.value = true;
+      notice.value = "请在 5 分钟内输入验证码：在受信任设备的 设置 → 你的名字 → 登录与安全 → 获取验证码 生成，或点“用短信接收”。";
+      return;
+    }
+    cookieValues.value = {};
     passwordForm.value.app_password = "";
     loginForm.value = { password: "", otp_code: "" };
+    loginAwaitingOtp.value = false;
     await loadAccounts();
     if (!context.current()) return;
     await loadAccountData({ includeInbox: true, force: true });
     if (context.current()) notice.value = result.warning ? `凭据已保存；${result.warning}` : kind === "login" ? "登录成功" : "凭据已更新";
   } catch (err) {
-    if (context.current()) setError(err);
+    if (!context.current()) return;
+    // 410: 暂存的握手已过期或已用完, 回到密码步骤重新发起。
+    if (kind === "login" && (err as { status?: number })?.status === 410) {
+      loginAwaitingOtp.value = false;
+      loginForm.value = { password: "", otp_code: "" };
+    }
+    setError(err);
   } finally {
     if (context.current()) accountActionBusy.value = false;
   }
+}
+
+async function requestLoginSms() {
+  const context = accountContext();
+  if (!context.accountID || accountActionBusy.value || !loginAwaitingOtp.value) return;
+  accountActionBusy.value = true;
+  clearFeedback();
+  try {
+    const result = await api<{ phone?: string }>(`/api/accounts/${encodeURIComponent(context.accountID)}/login/sms`, { method: "POST", body: "{}" });
+    if (!context.current()) return;
+    notice.value = result.phone ? `短信验证码已发送到 ${result.phone}，请在 5 分钟内输入。` : "短信验证码已发送，请在 5 分钟内输入。";
+  } catch (err) {
+    if (!context.current()) return;
+    if ((err as { status?: number })?.status === 410) {
+      loginAwaitingOtp.value = false;
+      loginForm.value = { password: "", otp_code: "" };
+    }
+    setError(err);
+  } finally {
+    if (context.current()) accountActionBusy.value = false;
+  }
+}
+
+function cancelLoginOtp() {
+  loginAwaitingOtp.value = false;
+  loginForm.value = { password: "", otp_code: "" };
+  clearFeedback();
 }
 
 async function changeAlias(alias: Alias, action: "deactivate" | "reactivate" | "delete") {
@@ -733,7 +782,11 @@ async function loadInbox(alias = selectedAlias.value, options: { prefetchBody?: 
     if (!messages.value.some((message) => message.id === selectedMessageId.value)) {
       selectedMessageId.value = messages.value[0]?.id ?? "";
     }
-    void prefetchMessageBodies({ priorityId: selectedMessageId.value, force: Boolean(options.prefetchBody) });
+    void prefetchMessageBodies({
+      priorityId: selectedMessageId.value,
+      force: Boolean(options.prefetchBody),
+      all: Boolean(options.prefetchBody),
+    });
   } catch (err) {
     if (context.current()) setError(err);
   } finally {
@@ -746,6 +799,30 @@ async function refreshAll() {
   await loadAccounts();
   if (token !== apiToken.value || authRequired.value) return;
   await loadAccountData({ includeInbox: true, withBody: activeTab.value === "codes", force: true });
+}
+
+function accountInitial(account: Account) {
+  const source = (account.name || account.icloud_email || account.real_email || account.id || "?").trim();
+  return Array.from(source)[0]?.toUpperCase() || "?";
+}
+
+function statusTone(account: Account) {
+  if (account.status === "active") return "active";
+  if (account.status === "reauth_required" || account.status === "error") return "warn";
+  return "idle";
+}
+
+function accountStatusLabel(account: Account) {
+  if (account.status === "active") return "会话可用";
+  if (account.status === "reauth_required") return "网页会话需重新登录";
+  if (account.status === "pending") return "待验证";
+  return account.status || "未知";
+}
+
+async function selectAccount(id: string) {
+  if (id === selectedAccountId.value) return;
+  selectedAccountId.value = id;
+  await handleAccountChange();
 }
 
 async function handleAccountChange() {
@@ -787,6 +864,30 @@ async function copyText(text: string) {
   }
 }
 
+function copyPickupURL(path: string) {
+  return copyText(new URL(path, window.location.origin).href);
+}
+
+async function rotatePickupURL(alias: Alias) {
+  const context = accountContext();
+  if (aliasActionBusy.value || !window.confirm(`重置 ${alias.email} 的取件地址？原链接会立即失效。`)) return;
+  aliasActionBusy.value = true;
+  clearFeedback();
+  try {
+    const result = await api<{ pickup_url: string }>("/api/pickup-address/rotate", {
+      method: "POST",
+      body: JSON.stringify({ account_id: context.accountID, alias: alias.email }),
+    });
+    if (!context.current()) return;
+    aliases.value = aliases.value.map((entry) => entry.email === alias.email ? { ...entry, pickup_url: result.pickup_url } : entry);
+    notice.value = "取件地址已重置，原链接已失效。";
+  } catch (err) {
+    if (context.current()) setError(err);
+  } finally {
+    if (context.current()) aliasActionBusy.value = false;
+  }
+}
+
 function clearAliasSelection() {
   selectedAlias.value = "";
   selectedMessageId.value = "";
@@ -800,20 +901,25 @@ async function ensureCodeBodies() {
     await loadInbox(selectedAlias.value, { prefetchBody: true });
     return;
   }
-  void prefetchMessageBodies({ force: true });
+  void prefetchMessageBodies({ force: true, all: true });
 }
 
-async function prefetchMessageBodies(options: { priorityId?: string; force?: boolean } = {}) {
+// Without `all`, only the priority message plus the first few are fetched, so opening
+// the inbox does not download every full message (attachments included) up front.
+const DEFAULT_BODY_PREFETCH = 5;
+
+async function prefetchMessageBodies(options: { priorityId?: string; force?: boolean; all?: boolean } = {}) {
   if (!selectedAccountId.value) return;
   const context = accountContext();
   const folder = selectedFolder.value;
-  const candidates = [...messages.value]
+  const pending = [...messages.value]
     .sort((a, b) => {
       if (a.id === options.priorityId) return -1;
       if (b.id === options.priorityId) return 1;
       return 0;
     })
     .filter((message) => message.uid && message.body === undefined);
+  const candidates = options.all ? pending : pending.slice(0, DEFAULT_BODY_PREFETCH);
   if (candidates.length === 0) return;
 
   const seq = prefetchSeq.value + 1;
@@ -859,17 +965,34 @@ function formatDate(value?: string) {
   return date.toLocaleString();
 }
 
+// 邮件时间统一按 UTC+8(北京时间)显示,不随浏览器所在时区变化。
+const UTC8_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function utc8Parts(value?: string) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const shifted = new Date(date.getTime() + UTC8_OFFSET_MS);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return {
+    date: `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`,
+    time: `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`,
+    seconds: pad(shifted.getUTCSeconds()),
+  };
+}
+
+// 列表里的简短时间,例如 "2026-11-25 15:52"。
 function formatMessageTime(value?: string) {
   if (!value) return "未知";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return formatDate(value);
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
+  const parts = utc8Parts(value);
+  return parts ? `${parts.date} ${parts.time}` : value;
+}
+
+// 邮件详情里的完整时间,例如 "2026-11-25 15:52:32 (UTC+8)"。
+function formatMessageDateTime(value?: string) {
+  if (!value) return "未知";
+  const parts = utc8Parts(value);
+  return parts ? `${parts.date} ${parts.time}:${parts.seconds} (UTC+8)` : value;
 }
 
 function folderLabel(optionOrName?: FolderOption | string) {
@@ -981,75 +1104,138 @@ onMounted(async () => {
       </section>
 
       <section v-if="activeTab === 'account'" class="account-view">
-        <article class="surface account-selector">
-          <div class="surface-title">
-            <UserRound :size="19" />
-            <span>当前账号</span>
+        <aside class="surface account-rail" aria-label="账号列表">
+          <div class="rail-head">
+            <div class="surface-title"><UserRound :size="19" /><span>账号</span></div>
+            <button class="mini-button" type="button" title="添加账号" aria-label="添加账号" :aria-pressed="accountFormOpen" @click="accountFormOpen = !accountFormOpen"><Plus :size="16" /></button>
           </div>
-          <select id="account" v-model="selectedAccountId" class="select" @change="handleAccountChange">
-            <option v-if="accounts.length === 0" value="">暂无账号</option>
-            <option v-for="account in accounts" :key="account.id" :value="account.id">
-              {{ account.name || account.id }}
-            </option>
-          </select>
-          <div v-if="activeAccount" class="account-details">
-            <span class="status-line">
-              <span class="status-dot" :class="{ active: activeAccount.status === 'active' }"></span>
-              {{ activeAccount.status || "unknown" }}
-            </span>
-            <strong>{{ accountDisplayEmail }}</strong>
-            <small>{{ activeAccount.host || "iCloud" }}</small>
-          </div>
-          <div class="account-buttons">
-            <button class="secondary-button" type="button" @click="accountFormOpen = !accountFormOpen"><Plus :size="16" />添加账号</button>
-            <button v-if="activeAccount" class="mini-button danger-button" type="button" title="删除账号" aria-label="删除账号" :disabled="accountActionBusy" @click="removeAccount"><Trash2 :size="16" /></button>
-          </div>
-        </article>
+          <p v-if="accounts.length === 0" class="rail-empty">暂无账号，点右上角 + 添加。</p>
+          <ul v-else class="account-list">
+            <li v-for="account in accounts" :key="account.id">
+              <button
+                type="button"
+                class="account-item"
+                :class="{ selected: account.id === selectedAccountId }"
+                :aria-current="account.id === selectedAccountId ? 'true' : undefined"
+                @click="selectAccount(account.id)"
+              >
+                <span class="account-avatar">{{ accountInitial(account) }}</span>
+                <span class="account-item-text">
+                  <strong>{{ account.name || account.id }}</strong>
+                  <small>{{ account.icloud_email || account.real_email || "未设置邮箱" }}</small>
+                </span>
+                <span class="status-dot" :class="statusTone(account)" :title="accountStatusLabel(account)"></span>
+              </button>
+            </li>
+          </ul>
+        </aside>
 
-        <article class="stat-tile">
-          <strong>{{ aliases.length }}</strong>
-          <span>全部别名</span>
-        </article>
-        <article class="stat-tile">
-          <strong>{{ activeAliases }}</strong>
-          <span>启用中</span>
-        </article>
-        <article class="stat-tile">
-          <strong>{{ inactiveAliases }}</strong>
-          <span>已停用</span>
-        </article>
+        <div class="account-main">
+          <form v-if="accountFormOpen" class="surface credential-form" @submit.prevent="addAccount">
+            <div class="surface-heading">
+              <div class="surface-title"><Plus :size="19" /><span>添加账号</span></div>
+              <button class="mini-button" type="button" title="关闭" aria-label="关闭" @click="accountFormOpen = false"><X :size="16" /></button>
+            </div>
+            <div class="account-fields">
+              <label class="form-field">显示名称<input v-model="accountForm.name" class="input" required autocomplete="off" /></label>
+              <label class="form-field">Apple ID<input v-model="accountForm.real_email" class="input" type="email" autocomplete="username" /></label>
+              <label class="form-field">地区<select v-model="accountForm.host" class="select"><option value="icloud.com">全球 · icloud.com</option><option value="icloud.com.cn">中国大陆 · icloud.com.cn</option></select></label>
+              <label class="form-field">代理地址<input v-model="accountForm.proxy" class="input" placeholder="http:// 或 socks5://" autocomplete="off" /></label>
+              <details class="account-wide cookie-fields">
+                <summary>填入 iCloud 网页 Cookie（可选）</summary>
+                <p class="cookie-hint">在已登录的 iCloud 网页打开开发者工具 → 应用 → Cookie，找到下列名称，逐项复制 Value 列。</p>
+                <label v-for="field in cookieFields" :key="field.name" class="form-field cookie-field">
+                  <span>{{ field.name }}<small v-if="field.optional">（可选）</small></span>
+                  <input v-model="accountForm.cookies[field.name]" type="password" class="input" placeholder="粘贴 Value" autocomplete="off" spellcheck="false" />
+                </label>
+              </details>
+            </div>
+            <div class="credential-actions">
+              <button class="primary-button compact" type="submit" :disabled="accountActionBusy || authRequired"><Loader2 v-if="accountActionBusy" class="spin" :size="16" /><Plus v-else :size="16" />添加账号</button>
+            </div>
+          </form>
 
-        <form v-if="accountFormOpen" class="account-form account-wide" @submit.prevent="addAccount">
-          <h3>添加账号</h3>
-          <div class="account-fields">
-            <label class="form-field">显示名称<input v-model="accountForm.name" class="input" required autocomplete="off" /></label>
-            <label class="form-field">Apple ID<input v-model="accountForm.real_email" class="input" type="email" autocomplete="username" /></label>
-            <label class="form-field">地区<select v-model="accountForm.host" class="select"><option value="icloud.com">全球 · icloud.com</option><option value="icloud.com.cn">中国大陆 · icloud.com.cn</option></select></label>
-            <label class="form-field">代理地址<input v-model="accountForm.proxy" class="input" placeholder="http:// 或 socks5://" autocomplete="off" /></label>
-            <label class="form-field account-wide">Cookie<textarea v-model="accountForm.cookies" class="input cookie-input" rows="3" placeholder="name=value; name2=value2 或 JSON" autocomplete="off"></textarea></label>
-          </div>
-          <button class="primary-button" type="submit" :disabled="accountActionBusy || authRequired"><Loader2 v-if="accountActionBusy" class="spin" :size="16" /><Plus v-else :size="16" />添加账号</button>
-        </form>
+          <template v-if="activeAccount">
+            <article class="surface account-overview">
+              <div class="overview-head">
+                <span class="account-avatar large">{{ accountInitial(activeAccount) }}</span>
+                <div class="overview-identity">
+                  <h3>{{ activeAccount.name || activeAccount.id }}</h3>
+                  <span>{{ accountDisplayEmail }}</span>
+                </div>
+                <button class="mini-button danger-button" type="button" title="删除账号" aria-label="删除账号" :disabled="accountActionBusy" @click="removeAccount"><Trash2 :size="16" /></button>
+              </div>
+              <div class="overview-tags">
+                <span class="status-chip" :class="statusTone(activeAccount)"><span class="status-dot" :class="statusTone(activeAccount)"></span>{{ accountStatusLabel(activeAccount) }}</span>
+                <span class="soft-tag blue">{{ activeAccount.host === "icloud.com.cn" ? "中国大陆" : "全球" }} · {{ activeAccount.host || "icloud.com" }}</span>
+                <span v-if="activeAccount.last_validated" class="overview-meta"><CalendarClock :size="14" />上次验证 {{ formatDate(activeAccount.last_validated) }}</span>
+              </div>
+              <dl class="overview-stats">
+                <div><dt>全部别名</dt><dd>{{ aliases.length }}</dd></div>
+                <div><dt>启用中</dt><dd class="good">{{ activeAliases }}</dd></div>
+                <div><dt>已停用</dt><dd>{{ inactiveAliases }}</dd></div>
+              </dl>
+            </article>
 
-        <div v-if="activeAccount" class="credential-grid account-wide">
-          <form class="account-form" @submit.prevent="saveCredentials('cookies')">
-            <h3>Cookie</h3>
-            <label class="form-field">Cookie 值<textarea v-model="cookieInput" class="input cookie-input" rows="4" required autocomplete="off" placeholder="name=value; name2=value2 或 JSON"></textarea></label>
-            <button class="secondary-button" type="submit" :disabled="accountActionBusy"><RefreshCw :size="16" />更新 Cookie</button>
-          </form>
-          <form class="account-form" @submit.prevent="saveCredentials('password')">
-            <h3>IMAP 凭据</h3>
-            <label class="form-field">iCloud 邮箱<input v-model="passwordForm.icloud_email" class="input" type="email" required autocomplete="username" /></label>
-            <label class="form-field">应用专用密码<input v-model="passwordForm.app_password" class="input" type="password" required autocomplete="new-password" /></label>
-            <button class="secondary-button" type="submit" :disabled="accountActionBusy"><KeyRound :size="16" />保存密码</button>
-          </form>
-          <form class="account-form" @submit.prevent="saveCredentials('login')">
-            <h3>Apple ID 登录</h3>
-            <span class="credential-identity">{{ activeAccount.real_email || activeAccount.name }}</span>
-            <label class="form-field">Apple ID 密码<input v-model="loginForm.password" class="input" type="password" required autocomplete="current-password" /></label>
-            <label class="form-field">双重认证验证码<input v-model="loginForm.otp_code" class="input" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" /></label>
-            <button class="secondary-button" type="submit" :disabled="accountActionBusy"><ShieldCheck :size="16" />登录</button>
-          </form>
+            <form class="surface credential-form" @submit.prevent="saveCredentials('login')">
+              <div class="credential-head">
+                <div class="surface-title"><ShieldCheck :size="19" /><span>Apple ID 登录</span></div>
+                <span class="credential-state" :class="{ ok: activeAccount.status === 'active' }">{{ activeAccount.status === "active" ? "会话可用" : "需要登录" }}</span>
+              </div>
+              <p class="credential-desc">用 Apple ID 密码登录，获取网页会话。登录后会话会自动续期。</p>
+              <ol class="login-steps" aria-label="登录步骤">
+                <li :class="{ current: !loginAwaitingOtp, done: loginAwaitingOtp }"><span>1</span>输入密码</li>
+                <li :class="{ current: loginAwaitingOtp }"><span>2</span>输入验证码</li>
+              </ol>
+              <span class="credential-identity">{{ activeAccount.real_email || activeAccount.name }}</span>
+              <label v-if="!loginAwaitingOtp" class="form-field">Apple ID 密码<input v-model="loginForm.password" class="input" type="password" required autocomplete="current-password" /></label>
+              <label v-else class="form-field">双重认证验证码<input v-model="loginForm.otp_code" class="input otp-input" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autofocus autocomplete="one-time-code" /></label>
+              <div class="credential-actions">
+                <button class="primary-button compact" type="submit" :disabled="accountActionBusy"><ShieldCheck :size="16" />{{ loginAwaitingOtp ? "提交验证码" : "登录" }}</button>
+                <button v-if="loginAwaitingOtp" class="secondary-button" type="button" :disabled="accountActionBusy" @click="requestLoginSms">用短信接收</button>
+                <button v-if="loginAwaitingOtp" class="secondary-button" type="button" :disabled="accountActionBusy" @click="cancelLoginOtp">重新输入密码</button>
+              </div>
+            </form>
+
+            <form class="surface credential-form" @submit.prevent="saveCredentials('password')">
+              <div class="credential-head">
+                <div class="surface-title"><KeyRound :size="19" /><span>IMAP 收件</span></div>
+                <span class="credential-state" :class="{ ok: activeAccount.has_app_password }">{{ activeAccount.has_app_password ? "已配置" : "未配置" }}</span>
+              </div>
+              <p class="credential-desc">收件箱和验证码通过 IMAP 读取，需要 iCloud 邮箱和应用专用密码。</p>
+              <div class="account-fields">
+                <label class="form-field">iCloud 邮箱<input v-model="passwordForm.icloud_email" class="input" type="email" required autocomplete="username" /></label>
+                <label class="form-field">应用专用密码<input v-model="passwordForm.app_password" class="input" type="password" required autocomplete="new-password" /></label>
+              </div>
+              <div class="credential-actions">
+                <button class="secondary-button" type="submit" :disabled="accountActionBusy"><KeyRound :size="16" />保存密码</button>
+              </div>
+            </form>
+
+            <details class="surface credential-form credential-collapsible">
+              <summary class="credential-head">
+                <div class="surface-title"><Link2 :size="19" /><span>手动更新 Cookie</span></div>
+                <span class="credential-state" :class="{ ok: activeAccount.has_cookies }">{{ activeAccount.has_cookies ? "已配置" : "未配置" }}</span>
+              </summary>
+              <form class="cookie-form" @submit.prevent="saveCredentials('cookies')">
+                <p class="credential-desc">无法用密码登录时的备用方式。在已登录的 iCloud 网页打开开发者工具 → 应用 → Cookie，找到下列名称，逐项复制 Value 列。未找到的项可先留空，由 Apple 验证会话是否可用。</p>
+                <div class="account-fields">
+                  <label v-for="field in cookieFields" :key="field.name" class="form-field cookie-field">
+                    <span>{{ field.name }}<small v-if="field.optional">（可选）</small></span>
+                    <input v-model="cookieValues[field.name]" type="password" class="input" placeholder="粘贴 Value" autocomplete="off" spellcheck="false" />
+                  </label>
+                </div>
+                <div class="credential-actions">
+                  <button class="secondary-button" type="submit" :disabled="accountActionBusy"><RefreshCw :size="16" />更新 Cookie</button>
+                </div>
+              </form>
+            </details>
+          </template>
+          <article v-else-if="!accountFormOpen" class="surface account-empty">
+            <UserRound :size="28" />
+            <p>还没有账号。添加一个 iCloud 账号后即可管理隐藏邮箱。</p>
+            <button class="primary-button compact" type="button" @click="accountFormOpen = true"><Plus :size="16" />添加账号</button>
+          </article>
         </div>
       </section>
 
@@ -1204,6 +1390,7 @@ onMounted(async () => {
           </button>
         </div>
 
+        <p v-if="activeAccount && !activeAccount.has_app_password" class="toolbar-note">分享取件地址要读取邮件，请先在账户中配置 IMAP 凭据。</p>
         <div v-if="busy.aliases" class="empty-state">正在读取别名列表...</div>
         <div v-else-if="aliases.length === 0" class="empty-state">当前账号还没有隐私邮箱别名。</div>
         <div v-else class="alias-list">
@@ -1224,6 +1411,8 @@ onMounted(async () => {
               <small>{{ formatDate(alias.createdAt) }}</small>
               <span class="job-actions">
                 <button class="mini-button" type="button" title="复制别名" aria-label="复制别名" @click="copyText(alias.email)"><Copy :size="14" /></button>
+                <button v-if="alias.pickup_url" class="mini-text-button" type="button" @click="copyPickupURL(alias.pickup_url)"><Link2 :size="14" />复制取件地址</button>
+                <button v-if="alias.pickup_url" class="mini-button" type="button" title="重置取件地址" aria-label="重置取件地址" :disabled="aliasActionBusy" @click="rotatePickupURL(alias)"><RefreshCw :size="14" /></button>
                 <button class="mini-button" type="button" :title="alias.active ? '停用别名' : '启用别名'" :aria-label="alias.active ? '停用别名' : '启用别名'" :disabled="aliasActionBusy" @click="changeAlias(alias, alias.active ? 'deactivate' : 'reactivate')"><Pause v-if="alias.active" :size="14" /><Play v-else :size="14" /></button>
                 <button class="mini-button danger-button" type="button" title="永久删除已停用别名" aria-label="删除别名" :disabled="aliasActionBusy || alias.active" @click="changeAlias(alias, 'delete')"><Trash2 :size="14" /></button>
               </span>
@@ -1258,6 +1447,9 @@ onMounted(async () => {
           <button class="mini-text-button" type="button" @click="copyText(selectedAliasInfo.email)">
             <Copy :size="14" />
             复制
+          </button>
+          <button v-if="selectedAliasInfo.pickup_url" class="mini-text-button" type="button" @click="copyPickupURL(selectedAliasInfo.pickup_url)">
+            <Link2 :size="14" />复制取件地址
           </button>
           <button class="mini-text-button" type="button" @click="clearAliasSelection">查看全部邮件</button>
         </div>
@@ -1409,7 +1601,7 @@ onMounted(async () => {
               <dt>收件人:</dt>
               <dd>{{ modalMessage.to || "未知" }}</dd>
               <dt>时间:</dt>
-              <dd>{{ formatDate(modalMessage.date) }}</dd>
+              <dd>{{ formatMessageDateTime(modalMessage.date) }}</dd>
             </dl>
 
             <div v-if="modalCode" class="code-line mail-modal-code">

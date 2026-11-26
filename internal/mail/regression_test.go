@@ -49,6 +49,48 @@ func TestIMAPFolderErrorsAreReturned(t *testing.T) {
 	}
 }
 
+func TestSharedPickupRejectsSubstringResultsFromIMAP(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	go func() {
+		defer remote.Close()
+		fmt.Fprint(remote, "* PREAUTH [CAPABILITY IMAP4rev1] ready\r\n")
+		scanner := bufio.NewScanner(remote)
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			switch fields[1] {
+			case "EXAMINE":
+				count := 0
+				if strings.Contains(strings.ToLower(scanner.Text()), "junk") {
+					count = 2
+				}
+				fmt.Fprintf(remote, "* %d EXISTS\r\n%s OK [READ-ONLY] selected\r\n", count, fields[0])
+			case "UID":
+				if fields[2] == "SEARCH" {
+					fmt.Fprintf(remote, "* SEARCH 41 42\r\n%s OK searched\r\n", fields[0])
+					continue
+				}
+				for index, address := range []string{"alias@icloud.com.example", "alias@icloud.com"} {
+					raw := "To: " + address + "\r\n\r\nBody"
+					fmt.Fprintf(remote, "* %d FETCH (UID %d BODY[] {%d}\r\n%s)\r\n", index+1, 41+index, len(raw), raw)
+				}
+				fmt.Fprintf(remote, "%s OK fetched\r\n", fields[0])
+			default:
+				fmt.Fprintf(remote, "%s BAD unexpected command\r\n", fields[0])
+			}
+		}
+	}()
+	cli, err := imapclient.New(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{cli: cli}
+	messages, err := client.PickupByRecipient("alias@icloud.com", 10, 7, true)
+	if err != nil || len(messages) != 1 || messages[0].UID != "42" || messages[0].Folder != "Junk" || messages[0].Preview != "Body" {
+		t.Fatalf("expected only the exact recipient with body, got %+v, err %v", messages, err)
+	}
+}
+
 func TestIMAPPartialFoldersPreserveMessagesAndFlags(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()

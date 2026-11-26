@@ -384,6 +384,22 @@ Body:
 
 ## Mail
 
+### Get a Fixed Pickup URL
+
+```http
+GET /api/pickup-address?account_id=acc_1&alias=alias%40icloud.com
+```
+
+The response includes `data.pickup_url`. The same field is returned by single creation, for each successful item in batch creation, and for active aliases in `GET /api/aliases`. The URL contains 32 random bytes encoded as hex, without the account ID or email address. It stays fixed across restarts; back up `data/pickup_links.json` with the account data. Set `ICLOUD_PRIME_PUBLIC_URL` to the public origin; otherwise the API returns a relative path.
+
+```http
+GET /api/pickup/<random-link-key>?limit=5&days=7&body=1&format=json
+```
+
+Reading this URL does not require the API Bearer token. Treat it as a password: anyone with the URL can read that alias's matching mail. Pickup searches Inbox and Junk. `limit` defaults to 1 and `days` defaults to 7; both are capped at 30. Opening the link in a browser shows a page with plain text mail bodies and a result count filter. Use `format=html` to request the page explicitly or `format=json` to request JSON regardless of the client’s `Accept` header. In JSON, `body=1` includes the parsed body text in `preview`. Shared links only return messages whose recipient headers can be verified through IMAP. With only a web session, a search that finds no messages can return an empty list, but unverified results are withheld. The original account-and-alias pickup route still requires the Bearer token.
+
+To invalidate a leaked link and generate a replacement, send an authenticated `POST /api/pickup-address/rotate` with JSON `{"account_id":"acc_1","alias":"alias@icloud.com"}`, or use the reset button in the alias list.
+
 ### Read Inbox
 
 ```http

@@ -117,6 +117,41 @@ func TestLateCookieRefreshCannotOverwriteNewCredentials(t *testing.T) {
 	}
 }
 
+func TestEmptyCookieRefreshPreservesSessionForReauthentication(t *testing.T) {
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := mgr.AddAccount("test", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := map[string]string{"session": "test cookie"}
+	if err := mgr.SaveCookies(acc.ID, initial); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveCookiesIfUnchanged(acc.ID, initial, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := mgr.GetAccount(acc.ID)
+	if current.Cookies["session"] != initial["session"] || current.Public().HasCookies || current.Public().Status != statusReauthRequired {
+		t.Fatal("expected saved cookies to be preserved and marked unusable")
+	}
+	if _, err := mgr.HMEClient(acc.ID, false); err != ErrHMEReauthRequired {
+		t.Fatalf("expected explicit reauthentication error, got %v", err)
+	}
+	if err := mgr.SaveCookiesIfUnchanged(acc.ID, initial, map[string]string{"session": "late reply"}); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = mgr.GetAccount(acc.ID)
+	if current.Cookies["session"] != initial["session"] || current.Status != statusReauthRequired {
+		t.Fatal("late response resurrected rejected credentials")
+	}
+}
+
 func TestAccountUpdatesAndReadersAreConcurrentSafe(t *testing.T) {
 	mgr, err := NewManager(t.TempDir())
 	if err != nil {

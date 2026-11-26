@@ -70,9 +70,23 @@ func (e *responseError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.status, e.body)
 }
 
-func isAuthenticationError(err error) bool {
+func IsAuthenticationError(err error) bool {
 	var response *responseError
-	return errors.As(err, &response) && (response.status == 401 || response.status == 403)
+	return errors.As(err, &response) && isAuthStatus(response.status)
+}
+
+// isAuthStatus: 401/403 是显式拒绝;421 (Misdirected Request) 是 iCloud 在会话 Cookie
+// 失效时的返回,比如缺少 X-APPLE-WEBAUTH-TOKEN,同样说明需要重新认证。
+func isAuthStatus(status int) bool {
+	return status == 401 || status == 403 || status == 421
+}
+
+func IsTemporaryAddressLimit(err error) bool {
+	if err == nil || IsAuthenticationError(err) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "reached the limit of addresses you can create right now")
 }
 
 // Client 是 iCloud Hide My Email 客户端。
@@ -92,6 +106,155 @@ type Client struct {
 	dsid        string // 从 validate 响应提取
 	clientID    string // UUID,每次会话生成
 	accountInfo *AccountInfo
+
+	// OnValidated 在每次 ValidateSession 成功后被调用,供调用方缓存会话。
+	OnValidated func(Session)
+
+	sharedTransport bool // httpc 来自共享 Transport,不可修改其 jar
+	sessionReused   bool // serviceURL 来自 UseSession,尚未在本客户端校验
+
+	// 登录时拿到的长期 token,用于会话失效时调用 accountLogin 免密重建。
+	sessionToken   string
+	trustToken     string
+	accountCountry string // accountLogin 的 accountCountryCode,如 CHN/USA
+
+	// Reauth 提供长期 token,供会话失效时免密重建;返回 ok=false 表示无可用 token。
+	Reauth     func() (sessionToken, trustToken string, ok bool)
+	reauthDone bool // 每个客户端最多尝试一次 token 刷新,避免循环
+
+	pending *authState // LoginBegin 保留的握手,等待 CompleteOTP
+}
+
+// Session 是 /validate 响应中调用 HME 接口所需的部分。
+// 同一账号的 serviceURL 和 dsid 基本不变,缓存后可跳过重复的 /validate。
+type Session struct {
+	ServiceURL  string
+	DSID        string
+	ClientID    string
+	AccountInfo *AccountInfo
+}
+
+// Session 返回当前已解析的会话;尚未校验时 ServiceURL 为空。
+func (c *Client) Session() Session {
+	return Session{ServiceURL: c.serviceURL, DSID: c.dsid, ClientID: c.clientID, AccountInfo: cloneAccountInfo(c.accountInfo)}
+}
+
+// UseSession 复用之前校验得到的会话,业务方法将不再先调用 /validate。
+func (c *Client) UseSession(s Session) {
+	c.serviceURL = s.ServiceURL
+	c.dsid = s.DSID
+	if s.ClientID != "" {
+		c.clientID = s.ClientID
+	}
+	c.accountInfo = cloneAccountInfo(s.AccountInfo)
+	c.sessionReused = s.ServiceURL != ""
+}
+
+// recoverFromAuthError 在请求遇到认证失败(401/403/421)时尝试恢复,返回 true 表示
+// 调用方可以重试。认证错误说明请求未被执行,所以重试写操作也是安全的。
+//
+// 先处理缓存会话失效(重新 /validate);validate 本身若也被拒,再用长期 token 免密
+// 重建会话。每个客户端最多免密重建一次,避免 token 已废时无限循环。
+func (c *Client) recoverFromAuthError(err error) bool {
+	if !IsAuthenticationError(err) {
+		return false
+	}
+	if c.sessionReused {
+		c.log("缓存的会话被拒绝,重新校验...")
+		c.sessionReused = false
+		c.serviceURL = ""
+		if c.ValidateSession() == nil {
+			return true
+		}
+	}
+	return c.tryTokenReauth()
+}
+
+// revalidateStale 保留旧名,等价于 recoverFromAuthError。
+func (c *Client) revalidateStale(err error) bool {
+	return c.recoverFromAuthError(err)
+}
+
+func (c *Client) tryTokenReauth() bool {
+	if c.reauthDone || c.Reauth == nil {
+		return false
+	}
+	c.reauthDone = true
+	sessionToken, trustToken, ok := c.Reauth()
+	if !ok || sessionToken == "" {
+		return false
+	}
+	c.log("会话失效,尝试用长期 token 免密刷新...")
+	if err := c.RefreshWebSession(sessionToken, trustToken); err != nil {
+		return false
+	}
+	c.serviceURL = ""
+	c.sessionReused = false
+	return c.ValidateSession() == nil
+}
+
+func cloneAccountInfo(info *AccountInfo) *AccountInfo {
+	if info == nil {
+		return nil
+	}
+	clone := *info
+	return &clone
+}
+
+// Transport 是可在同一账号的多个 Client 间共享的 HTTP 客户端,
+// 复用 TLS 连接。它不带 Cookie jar,只用于基于 Cookie 头的会话请求,不能用于 Login。
+type Transport struct {
+	httpc tls_client.HttpClient
+}
+
+// NewTransport 创建共享 HTTP 客户端。proxy 格式同 NewClient。
+func NewTransport(proxy string) (*Transport, error) {
+	httpc, err := newHTTPClient(proxy, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Transport{httpc: httpc}, nil
+}
+
+// Close 关闭空闲连接。
+func (t *Transport) Close() {
+	if t != nil && t.httpc != nil {
+		t.httpc.CloseIdleConnections()
+	}
+}
+
+// NewSessionClient 基于共享 Transport 创建 Cookie 会话客户端。
+func NewSessionClient(cookies map[string]string, host string, verbose bool, transport *Transport) *Client {
+	cookies = maps.Clone(cookies)
+	if cookies == nil {
+		cookies = make(map[string]string)
+	}
+	if host == "" {
+		host = "icloud.com"
+	}
+	return &Client{
+		Cookies:         cookies,
+		Host:            normalizeHost(host),
+		Verbose:         verbose,
+		httpc:           transport.httpc,
+		clientID:        uuid.New().String(),
+		sharedTransport: true,
+	}
+}
+
+func newHTTPClient(proxy string, jar http.CookieJar) (tls_client.HttpClient, error) {
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(profiles.Chrome_146),
+		tls_client.WithNotFollowRedirects(),
+	}
+	if jar != nil {
+		options = append(options, tls_client.WithCookieJar(jar))
+	}
+	if proxy != "" {
+		options = append(options, tls_client.WithProxyUrl(proxy))
+	}
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。
@@ -108,19 +271,7 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 		host = "icloud.com"
 	}
 	jar := tls_client.NewCookieJar()
-	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(30),
-		tls_client.WithClientProfile(profiles.Chrome_146),
-		tls_client.WithCookieJar(jar),
-		tls_client.WithNotFollowRedirects(),
-	}
-
-	// 添加代理支持
-	if proxy != "" {
-		options = append(options, tls_client.WithProxyUrl(proxy))
-	}
-
-	httpc, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	httpc, err := newHTTPClient(proxy, jar)
 	if err != nil {
 		return nil, err
 	}
@@ -237,9 +388,13 @@ func (c *Client) buildURL(rawURL string) string {
 func (c *Client) request(method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
 	// Session requests use the latest cross-host snapshot. Appending the login
 	// jar would send duplicate, potentially stale credentials under the same name.
-	jar := c.httpc.GetCookieJar()
-	c.httpc.SetCookieJar(nil)
-	defer c.httpc.SetCookieJar(jar)
+	// A shared Transport never has a jar; skip the swap so concurrent clients
+	// don't race on the shared http.Client.
+	if !c.sharedTransport {
+		jar := c.httpc.GetCookieJar()
+		c.httpc.SetCookieJar(nil)
+		defer c.httpc.SetCookieJar(jar)
+	}
 
 	if timeout == 0 {
 		timeout = RequestTimeout
@@ -334,15 +489,16 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// 认证失败(401/403/421)说明 Cookie 失效,不重试直接返回。
+			// 这类响应体里可能带 trustTokens 等凭据,不能进入错误信息、日志或 API 响应。
+			if isAuthStatus(resp.StatusCode) {
+				return "", &responseError{status: resp.StatusCode, body: "session rejected"}
+			}
 			snippet := string(text)
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
 			lastErr = &responseError{status: resp.StatusCode, body: snippet}
-			// 401/403 说明 Cookie 失效,不重试直接返回。
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				return "", lastErr
-			}
 			if attempt < maxAttempts {
 				c.sleepRetry(attempt)
 				continue
@@ -421,7 +577,11 @@ func (c *Client) ValidateSession() error {
 		}
 	}
 	c.accountInfo = info
+	c.sessionReused = false
 	c.log("会话有效 → %s", nonEmpty(info.AppleID, "未知账号"))
+	if c.OnValidated != nil {
+		c.OnValidated(c.Session())
+	}
 	return nil
 }
 
@@ -429,10 +589,14 @@ func (c *Client) ValidateSession() error {
 func (c *Client) AccountInfo() *AccountInfo { return c.accountInfo }
 
 func (c *Client) resolveService() error {
-	if c.serviceURL == "" {
-		return c.ValidateSession()
+	if c.serviceURL != "" {
+		return nil
 	}
-	return nil
+	err := c.ValidateSession()
+	if err != nil && c.tryTokenReauth() {
+		return nil
+	}
+	return err
 }
 
 // ListAliases 列出当前账号所有 Hide My Email 别名。
@@ -442,6 +606,9 @@ func (c *Client) ListAliases() ([]Alias, error) {
 	}
 	c.log("获取别名列表...")
 	body, err := c.request("GET", c.serviceURL+"/v2/hme/list", nil, 0, MaxRetries)
+	if err != nil && c.revalidateStale(err) {
+		body, err = c.request("GET", c.serviceURL+"/v2/hme/list", nil, 0, MaxRetries)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -467,6 +634,9 @@ func (c *Client) Generate() (string, error) {
 	}
 	c.log("生成候选别名...")
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/generate", generatePayload(), 0, 2)
+	if err != nil && c.revalidateStale(err) {
+		body, err = c.request("POST", c.serviceURL+"/v1/hme/generate", generatePayload(), 0, 2)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -502,6 +672,9 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 		"note":  "Created by icloud_hme tool",
 	}
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 2)
+	if err != nil && c.revalidateStale(err) {
+		body, err = c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 2)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -547,7 +720,7 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 		if err != nil {
 			lastErr = fmt.Errorf("generate 失败: %w", err)
 			c.log("%s", lastErr)
-			if isAuthenticationError(err) {
+			if IsAuthenticationError(err) || IsTemporaryAddressLimit(err) {
 				break
 			}
 			if attempt < maxRetries-1 {
@@ -560,7 +733,7 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 		if err != nil {
 			lastErr = err
 			c.log("reserve 失败: %s", lastErr)
-			if isAuthenticationError(err) {
+			if IsAuthenticationError(err) || IsTemporaryAddressLimit(err) {
 				break
 			}
 			if attempt < maxRetries-1 {
@@ -589,6 +762,9 @@ func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
 	c.log("停用 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/deactivate", payload, 0, 2)
+	if err != nil && c.revalidateStale(err) {
+		body, err = c.request("POST", c.serviceURL+"/v1/hme/deactivate", payload, 0, 2)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -603,6 +779,9 @@ func (c *Client) ReactivateHME(anonymousID string) (bool, error) {
 	c.log("激活 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/reactivate", payload, 0, 2)
+	if err != nil && c.revalidateStale(err) {
+		body, err = c.request("POST", c.serviceURL+"/v1/hme/reactivate", payload, 0, 2)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -620,6 +799,9 @@ func (c *Client) Delete(anonymousID string) error {
 		return c.request("POST", c.serviceURL+"/v1/hme/delete", payload, 0, 2)
 	}
 	body, err := doDelete()
+	if err != nil && c.revalidateStale(err) {
+		body, err = doDelete()
+	}
 	if err != nil || !gjson.Get(body, "success").Bool() {
 		c.log("直接删除失败,尝试先停用...")
 		_, _ = c.request("POST", c.serviceURL+"/v1/hme/deactivate", payload, 0, 2)

@@ -488,9 +488,40 @@ func TestJobRecordsErrorWithoutConsumingQuota(t *testing.T) {
 	}
 }
 
-func TestJobBacksOffAfterHTTP421WithoutStopping(t *testing.T) {
+func TestJobStopsOnHTTP421SessionFailure(t *testing.T) {
+	// iCloud 的 421 (Misdirected Request) 表示网页会话失效,免密刷新也救不回时
+	// 应停下任务等待重新登录,而不是每小时再失败一次。限流用的是 429,另行退避。
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.Local)
-	s := newTestScheduler(t, &fakeCreator{fail: errors.New("HTTP 421: request throttled")}, now)
+	s := newTestScheduler(t, &fakeCreator{fail: errors.New("HTTP 421: session rejected")}, now)
+
+	job, err := s.UpsertJob(JobRequest{AccountID: "acc_1", Mode: ModeDuration, DurationHours: 1})
+	if err != nil {
+		t.Fatalf("upsert failed: %v", err)
+	}
+	if err := s.RunDue(context.Background()); err != nil {
+		t.Fatalf("run due failed: %v", err)
+	}
+	updated, ok := s.GetJob(job.ID)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	if updated.Status != StatusError {
+		t.Fatalf("expected 421 session failure to stop the job, got %s", updated.Status)
+	}
+	if updated.LastError == "" {
+		t.Fatal("expected last error to be recorded")
+	}
+	if updated.NextRunAt != nil {
+		t.Fatalf("stopped job must not schedule a retry, got %v", updated.NextRunAt)
+	}
+	if got := s.RemainingThisHour("acc_1"); got != 5 {
+		t.Fatalf("failed create should not consume quota, got %d", got)
+	}
+}
+
+func TestJobBacksOffAfterHTTP429WithoutStopping(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.Local)
+	s := newTestScheduler(t, &fakeCreator{fail: errors.New("HTTP 429: too many requests")}, now)
 
 	job, err := s.UpsertJob(JobRequest{AccountID: "acc_1", Mode: ModeDuration, DurationHours: 1})
 	if err != nil {
@@ -504,7 +535,7 @@ func TestJobBacksOffAfterHTTP421WithoutStopping(t *testing.T) {
 		t.Fatal("job missing")
 	}
 	if updated.Status != StatusRunning {
-		t.Fatalf("expected transient 421 to keep job running, got %s", updated.Status)
+		t.Fatalf("expected transient 429 to keep job running, got %s", updated.Status)
 	}
 	if updated.LastError == "" {
 		t.Fatal("expected last error to be recorded")
@@ -514,6 +545,43 @@ func TestJobBacksOffAfterHTTP421WithoutStopping(t *testing.T) {
 	}
 	if got := s.RemainingThisHour("acc_1"); got != 5 {
 		t.Fatalf("failed create should not consume quota, got %d", got)
+	}
+}
+
+func TestJobRecoversFromAppleAddressLimit(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 59, 0, 0, time.Local)
+	attempts := 0
+	s := newTestScheduler(t, creatorFunc(func(_ context.Context, _, _ string) (*CreateResult, error) {
+		attempts++
+		if attempts == 1 {
+			now = now.Add(2 * time.Minute)
+			return nil, errors.New("创建别名失败: 保留失败: You have reached the limit of addresses you can create right now. Please try again later.")
+		}
+		return &CreateResult{Email: "alias@example.com"}, nil
+	}), now)
+	s.now = func() time.Time { return now }
+	job, err := s.UpsertJob(JobRequest{AccountID: "acc_1", Mode: ModeDailyWindow, StartTime: "00:00", EndTime: "00:00"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := s.GetJob(job.ID)
+	retryAt := time.Date(2026, 8, 9, 12, 0, 0, 0, time.Local)
+	if updated.Status != StatusRunning || updated.LastError == "" || updated.NextRunAt == nil || !updated.NextRunAt.Equal(retryAt) {
+		t.Fatalf("expected running job with retry at %v, got %+v", retryAt, updated)
+	}
+	if err := s.RunDue(context.Background()); err != nil || attempts != 1 {
+		t.Fatalf("job retried before the next hour, attempts=%d err=%v", attempts, err)
+	}
+	now = retryAt
+	if err := s.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ = s.GetJob(job.ID)
+	if attempts != 2 || updated.Status != StatusRunning || updated.CreatedCount != 1 || updated.LastError != "" {
+		t.Fatalf("expected automatic recovery, attempts=%d job=%+v", attempts, updated)
 	}
 }
 

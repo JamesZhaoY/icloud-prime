@@ -115,6 +115,24 @@ func TestMessageMatchesAliasFromRawHeaders(t *testing.T) {
 	}
 }
 
+func TestPickupRequiresExactRecipientHeader(t *testing.T) {
+	const alias = "alias@icloud.com"
+	for _, test := range []struct {
+		header netmail.Header
+		want   bool
+	}{
+		{netmail.Header{"To": {"Other <other@icloud.com>"}, "X-Original-To": {"ALIAS@icloud.com"}}, true},
+		{netmail.Header{"To": {"alias@icloud.com.example"}}, false},
+		{netmail.Header{"To": {"other@icloud.com"}, "From": {alias}, "Subject": {alias}}, false},
+		{netmail.Header{"X-Icloud-Hme": {"p=ALIAS@icloud.com; other metadata"}}, true},
+		{netmail.Header{"X-Icloud-Hme": {"p=alias@icloud.com.example; " + alias}}, false},
+	} {
+		if got := pickupRecipientMatches(test.header, alias); got != test.want {
+			t.Errorf("recipient check returned %v, want %v for %v", got, test.want, test.header)
+		}
+	}
+}
+
 func TestToMessageSummaryDoesNotReadFetchedBody(t *testing.T) {
 	section := &imap.BodySectionName{}
 	msg := &imap.Message{

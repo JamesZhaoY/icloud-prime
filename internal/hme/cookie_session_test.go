@@ -98,3 +98,22 @@ func TestCreateAliasDoesNotRetryExpiredSession(t *testing.T) {
 		})
 	}
 }
+
+func TestCreateAliasReturnsTemporaryAddressLimitWithoutRetrying(t *testing.T) {
+	attempts := 0
+	client := &Client{serviceURL: "https://p68-maildomainws.icloud.com", httpc: mockHTTP{do: func(req *http.Request) (*http.Response, error) {
+		attempts++
+		switch req.URL.Path {
+		case "/v1/hme/generate":
+			return mockResponse(200, `{"success":true,"result":{"hme":"alias@icloud.com"}}`), nil
+		case "/v1/hme/reserve":
+			return mockResponse(200, `{"success":false,"error":{"errorMessage":"You have reached the limit of addresses you can create right now. Please try again later."}}`), nil
+		default:
+			t.Fatalf("unexpected request %s", req.URL.Path)
+			return nil, nil
+		}
+	}}}
+	if _, err := client.CreateAlias("test", 3); !IsTemporaryAddressLimit(err) || attempts != 2 {
+		t.Fatalf("expected temporary limit after one generate/reserve pair, got %v after %d requests", err, attempts)
+	}
+}

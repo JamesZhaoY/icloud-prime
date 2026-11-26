@@ -12,11 +12,11 @@ const js = ts.transpile(script, { target: ts.ScriptTarget.ES2022 });
 const names = [
   "accounts", "aliases", "messages", "createJobs", "selectedAccountId", "selectedAlias", "selectedFolder",
   "selectedMessageId", "mailLimit", "onlyUnread", "onlyHideMyEmail", "visibleMessages", "extractedCodes",
-  "activeTab", "notice", "error", "busy", "accountForm", "accountFormOpen", "cookieInput", "passwordForm",
-  "loginForm", "apiToken", "tokenDraft", "authRequired", "cookieStatusLabel", "inboxStatusLabel",
+  "activeTab", "notice", "error", "busy", "accountForm", "accountFormOpen", "cookieValues", "passwordForm",
+  "loginForm", "loginAwaitingOtp", "requestLoginSms", "apiToken", "tokenDraft", "authRequired", "cookieStatusLabel", "inboxStatusLabel",
   "loadAccounts", "loadInbox", "loadAliases", "loadCreateJobs", "handleAccountChange", "prefetchMessageBodies",
   "ensureCodeBodies", "addAccount", "removeAccount", "saveCredentials", "saveApiToken", "changeAlias",
-  "createAlias", "createAliasBatch", "updateCreateJobStatus", "parseCookieInput",
+  "createAlias", "createAliasBatch", "updateCreateJobStatus", "formatMessageTime", "formatMessageDateTime",
 ];
 const reply = (data, status = 200, message = "request failed") => ({
   status, ok: status >= 200 && status < 300,
@@ -55,6 +55,18 @@ function harness(t, route = () => undefined) {
   return { app, calls, storage, setAccounts: (value) => { remoteAccounts = value; } };
 }
 
+test("login explains a proxy HTML error and requests JSON", async (t) => {
+  const { app, calls } = harness(t, ({ url }) => url.endsWith("/login") ? {
+    status: 502, ok: false,
+    json: async () => { throw new SyntaxError("Unexpected token '<'"); },
+  } : undefined);
+  app.selectedAccountId.value = "A";
+  app.loginForm.value = { password: "test input", otp_code: "" };
+  await app.saveCredentials("login");
+  assert.match(app.error.value, /无法完成 Apple ID 登录.*HTTP 502/);
+  assert.equal(calls[0].init.headers.get("Accept"), "application/json");
+});
+
 test("empty installation opens account creation, then creates and selects an account", async (t) => {
   const { app, calls, setAccounts } = harness(t, ({ url, init }) => url === "/api/accounts" && init.method === "POST"
     ? reply({ id: "new", name: "New account", has_cookies: true }) : undefined);
@@ -62,14 +74,16 @@ test("empty installation opens account creation, then creates and selects an acc
   await app.loadAccounts();
   assert.equal(app.activeTab.value, "account");
   assert.equal(app.accountFormOpen.value, true);
-  app.accountForm.value = { name: " New account ", real_email: "apple@example.com", host: "icloud.com", proxy: "", cookies: "token=abc==" };
+  const cookies = { "X-APPLE-WEBAUTH-USER": "v=1:s=1:d=42" };
+  app.accountForm.value = { name: " New account ", real_email: "apple@example.com", host: "icloud.com", proxy: "", cookies };
   await app.addAccount();
   assert.equal(app.selectedAccountId.value, "new");
   assert.equal(app.accountFormOpen.value, false);
   const create = calls.find((call) => call.init.method === "POST");
   assert.equal(create.body.name, "New account");
   assert.equal(create.body.real_email, "apple@example.com");
-  assert.equal(app.accountForm.value.cookies, "");
+  assert.deepEqual(JSON.parse(create.body.cookies), cookies);
+  assert.equal(Object.keys(app.accountForm.value.cookies).length, 0);
 });
 
 test("account and inbox responses cannot replace data after account switching", async (t) => {
@@ -121,7 +135,7 @@ test("old alias/job reads and old job actions cannot act on a newly selected acc
   assert.equal(calls.filter((call) => call.init.method === "POST").length, 0);
 });
 
-test("all 100 bodies load in bounded batches, including codes after message 50", async (t) => {
+test("default prefetch is bounded; codes tab loads the rest in batches, including codes after message 50", async (t) => {
   const { app, calls } = harness(t, ({ url, body }) => url === "/api/messages" ? reply({
     messages: body.messages.map(({ uid, folder }) => mail(uid, { folder, body: uid === "100" ? "Verification code 123456" : "" })),
   }) : undefined);
@@ -129,11 +143,44 @@ test("all 100 bodies load in bounded batches, including codes after message 50",
   app.mailLimit.value = 100;
   app.messages.value = Array.from({ length: 100 }, (_, index) => mail(index + 1));
   await app.prefetchMessageBodies();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body.messages.map((m) => m.uid), ["1", "2", "3", "4", "5"]);
   await app.ensureCodeBodies();
-  assert.equal(calls.length, 2);
-  assert.ok(calls.every((call) => call.body.messages.length === 50));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls.map((call) => call.body.messages.length), [5, 50, 45]);
+  assert.ok(calls.slice(1).every((call) => call.body.messages.every((m) => Number(m.uid) > 5)));
   assert.equal(app.messages.value[99].body, "Verification code 123456");
   assert.equal(app.extractedCodes.value[0].code, "123456");
+});
+
+test("default prefetch puts the selected message first and stays within the bound", async (t) => {
+  const { app, calls } = harness(t, ({ url, body }) => url === "/api/messages" ? reply({
+    messages: body.messages.map(({ uid, folder }) => mail(uid, { folder, body: `body ${uid}` })),
+  }) : undefined);
+  app.selectedAccountId.value = "A";
+  app.messages.value = Array.from({ length: 30 }, (_, index) => mail(index + 1));
+  await app.prefetchMessageBodies({ priorityId: "INBOX:20" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body.messages.map((m) => m.uid), ["20", "1", "2", "3", "4"]);
+  assert.equal(app.messages.value[19].body, "body 20");
+  assert.equal(app.messages.value[10].body, undefined);
+});
+
+test("opening the inbox fetches only a few bodies; the codes path fetches all", async (t) => {
+  const inbox = Array.from({ length: 40 }, (_, index) => mail(index + 1));
+  const { app, calls } = harness(t, ({ url, body }) => {
+    if (url.startsWith("/api/inbox?")) return reply({ messages: inbox, count: inbox.length, method: "imap" });
+    if (url === "/api/messages") return reply({ messages: body.messages.map(({ uid, folder }) => mail(uid, { folder, body: "b" })) });
+    return undefined;
+  });
+  app.selectedAccountId.value = "A";
+  await app.loadInbox();
+  await new Promise((resolve) => setImmediate(resolve));
+  const bodyCalls = () => calls.filter((call) => call.url === "/api/messages");
+  assert.deepEqual(bodyCalls().map((call) => call.body.messages.length), [5]);
+  await app.loadInbox(undefined, { prefetchBody: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(bodyCalls().map((call) => call.body.messages.length), [5, 40]);
 });
 
 test("body responses cannot merge by colliding UID across accounts", async (t) => {
@@ -182,18 +229,61 @@ test("API token can recover initial 401 and is sent with JSON write requests", a
 test("credential writes use existing API methods, preserve cookie equals, and redact inputs", async (t) => {
   const { app, calls } = harness(t);
   await app.loadAccounts();
-  app.cookieInput.value = "token=abc==; session=value";
+  app.cookieValues.value = { "X-APPLE-WEBAUTH-TOKEN": " abc== ", "X-APPLE-WEBAUTH-USER": "v=1:s=1:d=42", "X-APPLE-WEBAUTH-HSA-TRUST": " " };
   await app.saveCredentials("cookies");
   const cookieCall = calls.find((call) => call.url.endsWith("/cookies"));
   assert.equal(cookieCall.init.method, "PUT");
-  assert.equal(cookieCall.body.cookies.token, "abc==");
-  assert.equal(app.cookieInput.value, "");
-  app.loginForm.value = { password: "apple-password", otp_code: "123456" };
+  assert.deepEqual(cookieCall.body.cookies, { "X-APPLE-WEBAUTH-TOKEN": "abc==", "X-APPLE-WEBAUTH-USER": "v=1:s=1:d=42" });
+  assert.equal(Object.keys(app.cookieValues.value).length, 0);
+  app.loginForm.value = { password: "apple-password", otp_code: "" };
   await app.saveCredentials("login");
   const login = calls.find((call) => call.url.endsWith("/login"));
-  assert.equal(login.body.otp_code, "123456");
+  assert.equal(login.body.password, "apple-password");
+  assert.equal(login.body.otp_code, undefined);
   assert.equal(app.loginForm.value.password, "");
-  assert.throws(() => app.parseCookieInput('{"token":42}'));
+});
+
+test("login is two-step: password first, then only the code on the kept handshake", async (t) => {
+  let step = 0;
+  const { app, calls } = harness(t, ({ url }) => {
+    if (!url.endsWith("/login")) return undefined;
+    step++;
+    return step === 1 ? reply({ id: "A", needs_otp: true }) : reply({ id: "A" });
+  });
+  await app.loadAccounts();
+  app.loginForm.value = { password: "pw-1", otp_code: "" };
+  await app.saveCredentials("login");
+  assert.equal(app.loginAwaitingOtp.value, true);
+  assert.equal(app.loginForm.value.password, "", "password must not stay in memory");
+  assert.match(app.notice.value, /获取验证码/);
+  app.loginForm.value.otp_code = " 123456 ";
+  await app.saveCredentials("login");
+  const logins = calls.filter((call) => call.url.endsWith("/login"));
+  assert.equal(logins.length, 2);
+  assert.deepEqual(logins[0].body, { password: "pw-1" });
+  assert.deepEqual(logins[1].body, { otp_code: "123456" }, "code step must not resend the password");
+  assert.equal(app.loginAwaitingOtp.value, false);
+  assert.equal(app.notice.value, "登录成功");
+});
+
+test("expired pending login returns to the password step", async (t) => {
+  const { app } = harness(t, ({ url }) => url.endsWith("/login") ? reply(null, 410, "登录会话已过期,请重新用密码登录") : undefined);
+  await app.loadAccounts();
+  app.loginAwaitingOtp.value = true;
+  app.loginForm.value = { password: "", otp_code: "123456" };
+  await app.saveCredentials("login");
+  assert.equal(app.loginAwaitingOtp.value, false);
+  assert.match(app.error.value, /已过期/);
+});
+
+test("wrong code keeps the code step", async (t) => {
+  const { app } = harness(t, ({ url }) => url.endsWith("/login") ? reply(null, 422, "验证码错误") : undefined);
+  await app.loadAccounts();
+  app.loginAwaitingOtp.value = true;
+  app.loginForm.value = { password: "", otp_code: "000000" };
+  await app.saveCredentials("login");
+  assert.equal(app.loginAwaitingOtp.value, true);
+  assert.match(app.error.value, /验证码错误/);
 });
 
 test("account deletion chooses next account and clears old mailbox state", async (t) => {
@@ -269,7 +359,7 @@ test("credential validation warnings and partial folder warnings stay visible", 
   const { app } = harness(t, ({ url }) => url.endsWith("/cookies") ? reply({ warning: "Cookie could not be validated" })
     : url.startsWith("/api/inbox?") ? reply({ messages: [], count: 0, warning: "Junk folder unavailable" }) : undefined);
   await app.loadAccounts();
-  app.cookieInput.value = "token=abc";
+  app.cookieValues.value = { "X-APPLE-WEBAUTH-TOKEN": "abc" };
   await app.saveCredentials("cookies");
   assert.match(app.notice.value, /Cookie could not be validated/);
   await app.loadInbox();
@@ -287,4 +377,35 @@ test("alias controls invoke account-scoped existing endpoints", async (t) => {
   assert.deepEqual(writes.map((call) => call.url), ["/api/aliases/alias%2F1/deactivate", "/api/aliases/alias%2F1/reactivate", "/api/aliases/alias%2F1"]);
   assert.ok(writes.every((call) => call.body.account_id === "A"));
   assert.equal(writes[2].init.method, "DELETE");
+});
+
+test("SMS request keeps the code step and shows the masked phone", async (t) => {
+  const { app, calls } = harness(t, ({ url }) => url.endsWith("/login/sms") ? reply({ id: "A", phone: "••• ••12" }) : undefined);
+  await app.loadAccounts();
+  app.loginAwaitingOtp.value = true;
+  await app.requestLoginSms();
+  const sms = calls.find((call) => call.url.endsWith("/login/sms"));
+  assert.equal(sms.init.method, "POST");
+  assert.equal(app.loginAwaitingOtp.value, true);
+  assert.match(app.notice.value, /••• ••12/);
+});
+
+test("SMS request on an expired login returns to the password step", async (t) => {
+  const { app } = harness(t, ({ url }) => url.endsWith("/login/sms") ? reply(null, 410, "登录会话已过期,请重新用密码登录") : undefined);
+  await app.loadAccounts();
+  app.loginAwaitingOtp.value = true;
+  await app.requestLoginSms();
+  assert.equal(app.loginAwaitingOtp.value, false);
+  assert.match(app.error.value, /已过期/);
+});
+
+test("mail times are shown in UTC+8 regardless of the source offset", (t) => {
+  const { app } = harness(t);
+  assert.equal(app.formatMessageTime("2026-11-25T07:52:32Z"), "2026-11-25 15:52");
+  assert.equal(app.formatMessageTime("2026-11-25T15:52:32+08:00"), "2026-11-25 15:52");
+  assert.equal(app.formatMessageTime("2026-11-24T23:30:00-05:00"), "2026-11-25 12:30");
+  assert.equal(app.formatMessageDateTime("2026-11-25T07:52:32Z"), "2026-11-25 15:52:32 (UTC+8)");
+  assert.equal(app.formatMessageTime("2026-12-31T16:00:00Z"), "2027-01-01 00:00", "crosses the year boundary");
+  assert.equal(app.formatMessageTime(""), "未知");
+  assert.equal(app.formatMessageTime("not a date"), "not a date");
 });

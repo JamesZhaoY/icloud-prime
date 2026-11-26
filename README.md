@@ -1,24 +1,14 @@
 # iCloud Prime
 
-[![CI](https://github.com/forever94yu/icloud-prime/actions/workflows/ci.yml/badge.svg)](https://github.com/forever94yu/icloud-prime/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/forever94yu/icloud-prime)](https://github.com/forever94yu/icloud-prime/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+本仓库基于 forever94yu 的 iCloud Prime 二次开发，感谢原作者。上游项目采用 MIT 许可证，本仓库保留原作者的版权声明和许可全文。[原始仓库](https://github.com/forever94yu/icloud-prime) · [二次开发起点](https://github.com/forever94yu/icloud-prime/commit/0a8860318caf1c3d8c0096069ca65d47211cbdc0) · [MIT 许可证](LICENSE)
+
+本版本增加了固定取件链接、两阶段 Apple ID 登录和短信验证选项，调整了账号页布局，并优化了收件连接和别名缓存。邮件时间统一以 UTC+8 显示。
+
+[![CI](https://github.com/JamesZhaoY/icloud-prime/actions/workflows/ci.yml/badge.svg)](https://github.com/JamesZhaoY/icloud-prime/actions/workflows/ci.yml)
 
 iCloud Prime is a local, self-hosted management console for Apple iCloud Hide My Email aliases.
 It provides a web UI and HTTP API for managing multiple iCloud accounts, creating aliases,
 listing aliases, and reading mail sent to aliases.
-
-Repository: <https://github.com/forever94yu/icloud-prime>
-
-## Project Status
-
-This project is public and open to community contributions.
-
-- Issues are enabled for bug reports, feature requests, questions, and documentation feedback.
-- Pull requests are welcome from forks.
-- Discussions are enabled for usage help and roadmap conversations.
-- CI runs on pushes and pull requests.
-- Releases include a Windows 10 portable package with placeholder-only configuration.
 
 ## Security First
 
@@ -180,10 +170,10 @@ Common browser workflow:
 3. Open browser developer tools.
 4. Open Application or Storage.
 5. Find Cookies for iCloud.
-6. Copy the relevant iCloud Cookie values.
-7. Paste them into the web console account form.
+6. Find `X-APPLE-WEBAUTH-TOKEN`, `X-APPLE-WEBAUTH-USER`, and `X-APPLE-DS-WEB-SESSION-TOKEN` in the cookie table. If present, also copy `X-APPLE-WEBAUTH-HSA-TRUST` and `X-APPLE-WEBAUTH-PCS-Mail`.
+7. In the web console account form, paste just the **Value** for each key into its matching field. Use values from the same browser session.
 
-Accepted Cookie input formats:
+Accepted Cookie formats for API clients and the account configuration file:
 
 ```text
 X-APPLE-WEBAUTH-TOKEN=value; X-APPLE-WEBAUTH-USER=value; X-APPLE-DS-WEB-SESSION-TOKEN=value
@@ -505,6 +495,8 @@ DELETE /api/aliases/:id
 Mail:
 
 ```text
+GET /api/pickup-address?account_id=acc_1&alias=alias@icloud.com
+GET /api/pickup/<random-link-key>?limit=5&days=7&format=json
 GET /api/inbox?account_id=acc_1&alias=alias@icloud.com&limit=20&days=7
 GET /api/messages/:id?account_id=acc_1&folder=INBOX
 POST /api/messages
@@ -512,6 +504,10 @@ GET /api/mailboxes?account_id=acc_1
 ```
 
 See [API.md](API.md) for more detail.
+
+For a stable per-alias pickup URL, use the copy button in the alias list or read `pickup_url` from the authenticated API. Set `ICLOUD_PRIME_PUBLIC_URL` to your HTTPS origin to return absolute URLs. The random URL is itself a credential, so do not share it publicly. It can be reset in the alias list. Configure IMAP to verify the recipient headers before returning mail through shared pickup links.
+
+Open the pickup URL in a browser to see the latest message and its text body. Change the count on the page or pass `limit` in the URL to view up to 30 messages.
 
 ## Contributing
 

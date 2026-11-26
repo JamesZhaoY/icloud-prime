@@ -271,7 +271,7 @@ func (c *WebClient) search(payload any) ([]Message, error) {
 		}
 		date := ""
 		if t.Timestamp > 0 {
-			date = time.UnixMilli(t.Timestamp).Format(time.RFC3339)
+			date = FormatMessageTime(time.UnixMilli(t.Timestamp))
 		}
 		message := Message{
 			ID:      t.ThreadID,
@@ -309,6 +309,17 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		return c.ListInbox(limit)
 	}
 	return c.search(threadSearchPayload(alias, "recipient", limit))
+}
+
+func (c *WebClient) PickupByRecipient(alias string, limit int) ([]Message, error) {
+	messages, err := c.FindByAlias(alias, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) > 0 {
+		return nil, ErrPickupNeedsIMAP
+	}
+	return []Message{}, nil
 }
 
 // Request fields follow Apple's mail2 queryThreads implementation (2632Build28).

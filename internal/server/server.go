@@ -11,9 +11,11 @@ package server
 import (
 	"context"
 	"errors"
+	"log"
 	"maps"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,14 +30,20 @@ import (
 
 // Server 封装 Gin 引擎和账号管理器。
 type Server struct {
-	mgr        *account.Manager
-	scheduler  *createjob.Scheduler
-	r          *gin.Engine
-	cache      *responseCache
-	cacheTTL   time.Duration
-	folderTTL  time.Duration
-	messageTTL time.Duration
-	apiToken   string
+	mgr       *account.Manager
+	scheduler *createjob.Scheduler
+	r         *gin.Engine
+	cache     *responseCache
+	cacheTTL  time.Duration
+	// pickupStaleTTL 是取件校验可沿用的旧别名列表的最长年龄。超过 cacheTTL 但未超过它时,
+	// 取件直接用旧列表校验,并在后台刷新,不再同步等待 iCloud 别名列表(实测 10~20 秒)。
+	pickupStaleTTL time.Duration
+	aliasRefresh   sync.Map // accountID -> struct{}: 正在后台刷新别名列表
+	folderTTL      time.Duration
+	messageTTL     time.Duration
+	apiToken       string
+	publicURL      string
+	pickups        *pickupStore
 }
 
 type responseCache struct {
@@ -47,6 +55,7 @@ type responseCache struct {
 
 type aliasCacheEntry struct {
 	expires time.Time
+	fetched time.Time
 	data    []hme.Alias
 }
 
@@ -90,11 +99,17 @@ func NewWithScheduler(mgr *account.Manager, scheduler *createjob.Scheduler, debu
 			mailboxes: make(map[string]mailboxCacheEntry),
 			messages:  make(map[string]messageCacheEntry),
 		},
-		cacheTTL:   3 * time.Minute,
-		folderTTL:  10 * time.Minute,
-		messageTTL: 10 * time.Minute,
+		cacheTTL:       3 * time.Minute,
+		pickupStaleTTL: 30 * time.Minute,
+		folderTTL:      10 * time.Minute,
+		messageTTL:     10 * time.Minute,
 	}
-	s.r = gin.Default() // 自带 Logger + Recovery 中间件
+	s.r = gin.New()
+	s.r.Use(gin.LoggerWithConfig(gin.LoggerConfig{Skip: func(c *gin.Context) bool {
+		return strings.HasPrefix(c.Request.URL.Path, "/api/pickup/")
+	}}), gin.RecoveryWithWriter(nil, func(c *gin.Context, _ any) {
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
 	_ = s.r.SetTrustedProxies(nil)
 	s.register()
 	s.registerStatic()
@@ -117,6 +132,7 @@ func (s *Server) SetAPIToken(token string) {
 func (s *Server) Handler() http.Handler { return s.r }
 
 func (s *Server) register() {
+	s.r.GET("/api/pickup/:secret", s.sharedPickupInbox)
 	api := s.r.Group("/api", s.authorizeAPI)
 	{
 		// ===== 账号管理 =====
@@ -126,6 +142,7 @@ func (s *Server) register() {
 		api.POST("/accounts/:id/password", s.setAppPassword)
 		api.PUT("/accounts/:id/cookies", s.updateCookies)
 		api.POST("/accounts/:id/login", s.loginAccount)
+		api.POST("/accounts/:id/login/sms", s.requestLoginSMS)
 
 		// ===== 核心接口 1: 创建邮箱 =====
 		api.POST("/create", s.createAlias)
@@ -138,6 +155,9 @@ func (s *Server) register() {
 
 		// ===== 核心接口 2: 读取邮件 =====
 		api.GET("/inbox", s.listInbox)
+		api.GET("/pickup-address", s.getPickupAddress)
+		api.POST("/pickup-address/rotate", s.rotatePickupAddress)
+		api.GET("/pickup/:secret/:alias", s.pickupInbox)
 		api.GET("/messages/:id", s.getMessage)
 		api.POST("/messages", s.getMessages)
 		api.GET("/mailboxes", s.listMailboxes)
@@ -166,10 +186,36 @@ func (s *Server) cachedAliases(accountID string) ([]hme.Alias, bool) {
 func (s *Server) setCachedAliases(accountID string, aliases []hme.Alias) {
 	s.cache.mu.Lock()
 	defer s.cache.mu.Unlock()
+	now := time.Now()
 	s.cache.aliases[accountID] = aliasCacheEntry{
-		expires: time.Now().Add(s.cacheTTL),
+		expires: now.Add(s.cacheTTL),
+		fetched: now,
 		data:    append([]hme.Alias(nil), aliases...),
 	}
+}
+
+// staleAliases 返回不超过 maxAge 的别名列表(可能已过 cacheTTL),供取件校验使用。
+func (s *Server) staleAliases(accountID string, maxAge time.Duration) ([]hme.Alias, bool) {
+	s.cache.mu.RLock()
+	defer s.cache.mu.RUnlock()
+	entry, ok := s.cache.aliases[accountID]
+	if !ok || time.Since(entry.fetched) > maxAge {
+		return nil, false
+	}
+	return append([]hme.Alias(nil), entry.data...), true
+}
+
+// refreshAliasesInBackground 在后台刷新别名缓存;同一账号同时只跑一次。
+func (s *Server) refreshAliasesInBackground(accountID string) {
+	if _, running := s.aliasRefresh.LoadOrStore(accountID, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer s.aliasRefresh.Delete(accountID)
+		if _, _, err := s.findAliases(accountID, true); err != nil {
+			log.Printf("后台刷新别名列表失败 account=%s: %v", accountID, err)
+		}
+	}()
 }
 
 func (s *Server) invalidateAliases(accountID string) {
@@ -279,7 +325,7 @@ func (h hmeAliasCreator) CreateAlias(ctx context.Context, accountID, label strin
 	}
 	before := maps.Clone(client.Cookies)
 	result, err := client.CreateAlias(label, 5)
-	_ = h.mgr.SaveCookiesIfUnchanged(accountID, before, client.Cookies)
+	_ = h.mgr.SaveHMEState(accountID, before, client.Cookies, err)
 	if err != nil {
 		return nil, err
 	}
@@ -324,16 +370,19 @@ func (s *Server) createAlias(c *gin.Context) {
 		return
 	}
 
+	c.Header("Cache-Control", "no-store")
 	ok(c, gin.H{
 		"email":      result.Email,
 		"label":      result.Label,
 		"created_at": result.CreatedAt,
 		"account_id": req.AccountID,
+		"pickup_url": s.issuePickupURL(req.AccountID, result.Email),
 	})
 	s.invalidateAliases(req.AccountID)
 }
 
 func (s *Server) createAliasBatch(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var req createjob.BatchRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, http.StatusBadRequest, "参数错误: account_id, count 必填 — "+err.Error())
@@ -345,7 +394,7 @@ func (s *Server) createAliasBatch(c *gin.Context) {
 	}
 	if err != nil {
 		if resp != nil && resp.CreatedCount > 0 {
-			ok(c, resp)
+			ok(c, s.batchWithPickup(resp))
 			return
 		}
 		msg := err.Error()
@@ -358,7 +407,7 @@ func (s *Server) createAliasBatch(c *gin.Context) {
 		}
 		return
 	}
-	ok(c, resp)
+	ok(c, s.batchWithPickup(resp))
 }
 
 func (s *Server) listCreateJobs(c *gin.Context) {
@@ -431,7 +480,10 @@ func (s *Server) listInbox(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "参数缺失: account_id")
 		return
 	}
-	alias := strings.TrimSpace(c.Query("alias"))
+	s.inbox(c, accountID, strings.TrimSpace(c.Query("alias")))
+}
+
+func (s *Server) inbox(c *gin.Context, accountID, alias string) {
 	folder := strings.TrimSpace(c.DefaultQuery("folder", "inbox"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
@@ -817,43 +869,93 @@ func (s *Server) updateCookies(c *gin.Context) {
 }
 
 type loginReq struct {
-	Password string `json:"password" binding:"required"`
-	OTPCode  string `json:"otp_code"` // 可选 2FA 验证码
+	Password string `json:"password"`
+	OTPCode  string `json:"otp_code"` // 第二步: 在第一步保留的握手上提交 2FA 验证码
 }
 
+// loginAccount 是两步式 Apple ID 登录:
+//  1. {password}: 发起握手。需要 2FA 时返回 needs_otp=true,Apple 把验证码推送到受信任设备,
+//     服务端暂存这次握手。
+//  2. {otp_code}: 在同一握手上提交验证码并完成登录,不会再触发新的推送。
 func (s *Server) loginAccount(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	id := c.Param("id")
-	var req loginReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: password 必填 — "+err.Error())
+	if _, exists := s.mgr.GetAccount(id); !exists {
+		fail(c, http.StatusNotFound, "账号不存在")
 		return
 	}
-
-	var otpProvider hme.OTPProvider
-	if req.OTPCode != "" {
-		otp := req.OTPCode
-		otpProvider = func() (string, error) {
-			return otp, nil
-		}
+	var req loginReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "参数错误: "+err.Error())
+		return
 	}
+	req.OTPCode = strings.TrimSpace(req.OTPCode)
 
-	_, err := s.mgr.HMEClientWithPassword(id, req.Password, otpProvider)
+	var err error
+	switch {
+	case req.OTPCode != "":
+		err = s.mgr.CompleteLoginOTP(id, req.OTPCode)
+	case req.Password != "":
+		err = s.mgr.BeginLogin(id, req.Password)
+	default:
+		fail(c, http.StatusBadRequest, "参数错误: 需要 password 或 otp_code")
+		return
+	}
+	if errors.Is(err, account.ErrLoginNeedsOTP) {
+		ok(c, gin.H{"id": id, "needs_otp": true})
+		return
+	}
 	if err != nil {
-		if isSessionError(err.Error()) {
-			fail(c, http.StatusUnauthorized, err.Error())
-		} else {
-			fail(c, http.StatusBadGateway, "登录失败: "+err.Error())
+		switch {
+		case errors.Is(err, account.ErrNoPendingLogin):
+			fail(c, http.StatusGone, account.ErrNoPendingLogin.Error())
+		case errors.Is(err, hme.ErrInvalidAppleCredentials):
+			fail(c, http.StatusUnauthorized, hme.ErrInvalidAppleCredentials.Error())
+		case errors.Is(err, hme.ErrAppleVerificationNeeded):
+			fail(c, http.StatusConflict, hme.ErrAppleVerificationNeeded.Error())
+		case errors.Is(err, hme.ErrInvalidAppleCode):
+			fail(c, http.StatusUnprocessableEntity, hme.ErrInvalidAppleCode.Error())
+		case errors.Is(err, hme.ErrAppleTermsRequired):
+			fail(c, http.StatusUnprocessableEntity, hme.ErrAppleTermsRequired.Error())
+		case errors.Is(err, account.ErrHMEReauthRequired):
+			fail(c, http.StatusUnprocessableEntity, "Apple 未返回可用的网页会话，请从已登录的 iCloud 网页更新 Cookie。")
+		default:
+			detail := redactLoginError(err)
+			log.Printf("Apple ID 登录失败 account=%s: %s", id, detail)
+			fail(c, http.StatusServiceUnavailable, "暂时无法完成 Apple ID 登录（"+detail+"），请稍后重试，或从已登录的 iCloud 网页更新 Cookie。")
 		}
 		return
 	}
 
 	s.clearCache()
-	ok(c, gin.H{
-		"id": id,
-	})
+	ok(c, gin.H{"id": id})
+}
+
+// requestLoginSMS 让 Apple 把登录验证码以短信发到受信任手机号(在 /login 第一步之后调用)。
+func (s *Server) requestLoginSMS(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	id := c.Param("id")
+	if _, exists := s.mgr.GetAccount(id); !exists {
+		fail(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+	phone, err := s.mgr.RequestLoginSMS(id)
+	switch {
+	case err == nil:
+		ok(c, gin.H{"id": id, "phone": phone})
+	case errors.Is(err, account.ErrNoPendingLogin):
+		fail(c, http.StatusGone, account.ErrNoPendingLogin.Error())
+	case errors.Is(err, hme.ErrNoTrustedPhone):
+		fail(c, http.StatusUnprocessableEntity, hme.ErrNoTrustedPhone.Error())
+	default:
+		detail := redactLoginError(err)
+		log.Printf("请求短信验证码失败 account=%s: %s", id, detail)
+		fail(c, http.StatusServiceUnavailable, "暂时无法发送短信验证码（"+detail+"）")
+	}
 }
 
 func (s *Server) listAliases(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	accountID := c.Query("account_id")
 	if accountID == "" {
 		fail(c, http.StatusBadRequest, "参数缺失: account_id")
@@ -863,39 +965,49 @@ func (s *Server) listAliases(c *gin.Context) {
 		fail(c, http.StatusNotFound, "账号不存在")
 		return
 	}
-	if c.Query("refresh") != "1" {
-		if aliases, cached := s.cachedAliases(accountID); cached {
-			ok(c, gin.H{
-				"account_id": accountID,
-				"count":      len(aliases),
-				"aliases":    aliases,
-				"cached":     true,
-			})
-			return
-		}
-	}
-	client, err := s.mgr.HMEClient(accountID, false)
+	aliases, cached, err := s.findAliases(accountID, c.Query("refresh") == "1")
 	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
-		return
-	}
-	before := maps.Clone(client.Cookies)
-	aliases, err := client.ListAliases()
-	_ = s.mgr.SaveCookiesIfUnchanged(accountID, before, client.Cookies)
-	if err != nil {
-		if isSessionError(err.Error()) {
+		if errors.Is(err, account.ErrHMEReauthRequired) {
+			fail(c, http.StatusUnauthorized, account.ErrHMEReauthRequired.Error())
+		} else if errors.Is(err, errAliasClient) {
+			fail(c, http.StatusNotFound, err.Error())
+		} else if isSessionError(err.Error()) {
 			fail(c, http.StatusUnauthorized, "iCloud 会话失效,请更新 Cookie: "+err.Error())
 		} else {
 			fail(c, http.StatusBadGateway, err.Error())
 		}
 		return
 	}
-	s.setCachedAliases(accountID, aliases)
-	ok(c, gin.H{
+	data := gin.H{
 		"account_id": accountID,
 		"count":      len(aliases),
-		"aliases":    aliases,
-	})
+		"aliases":    s.aliasesWithPickup(accountID, aliases),
+	}
+	if cached {
+		data["cached"] = true
+	}
+	ok(c, data)
+}
+
+var errAliasClient = errors.New("iCloud 别名客户端不可用")
+
+func (s *Server) findAliases(accountID string, refresh bool) ([]hme.Alias, bool, error) {
+	if !refresh {
+		if aliases, cached := s.cachedAliases(accountID); cached {
+			return aliases, true, nil
+		}
+	}
+	client, err := s.mgr.HMEClient(accountID, false)
+	if err != nil {
+		return nil, false, errors.Join(errAliasClient, err)
+	}
+	before := maps.Clone(client.Cookies)
+	aliases, err := client.ListAliases()
+	_ = s.mgr.SaveHMEState(accountID, before, client.Cookies, err)
+	if err == nil {
+		s.setCachedAliases(accountID, aliases)
+	}
+	return aliases, false, err
 }
 
 type aliasActionReq struct {
@@ -918,7 +1030,7 @@ func (s *Server) deactivateAlias(c *gin.Context) {
 
 	before := maps.Clone(client.Cookies)
 	success, err := client.DeactivateHME(anonymousID)
-	_ = s.mgr.SaveCookiesIfUnchanged(req.AccountID, before, client.Cookies)
+	_ = s.mgr.SaveHMEState(req.AccountID, before, client.Cookies, err)
 	if err != nil {
 		fail(c, http.StatusBadGateway, "停用失败: "+err.Error())
 		return
@@ -947,7 +1059,7 @@ func (s *Server) reactivateAlias(c *gin.Context) {
 
 	before := maps.Clone(client.Cookies)
 	success, err := client.ReactivateHME(anonymousID)
-	_ = s.mgr.SaveCookiesIfUnchanged(req.AccountID, before, client.Cookies)
+	_ = s.mgr.SaveHMEState(req.AccountID, before, client.Cookies, err)
 	if err != nil {
 		fail(c, http.StatusBadGateway, "激活失败: "+err.Error())
 		return
@@ -976,7 +1088,7 @@ func (s *Server) deleteAlias(c *gin.Context) {
 
 	before := maps.Clone(client.Cookies)
 	if err := client.Delete(anonymousID); err != nil {
-		_ = s.mgr.SaveCookiesIfUnchanged(req.AccountID, before, client.Cookies)
+		_ = s.mgr.SaveHMEState(req.AccountID, before, client.Cookies, err)
 		fail(c, http.StatusBadGateway, "删除失败: "+err.Error())
 		return
 	}
@@ -985,13 +1097,31 @@ func (s *Server) deleteAlias(c *gin.Context) {
 	ok(c, gin.H{"anonymous_id": anonymousID})
 }
 
+var (
+	urlQuery    = regexp.MustCompile(`\?[^\s"']*`)
+	urlUserinfo = regexp.MustCompile(`://[^/\s"'@]+@`)
+)
+
+// redactLoginError 返回可以展示和记录的登录失败原因:保留失败步骤和 HTTP 状态码,
+// 去掉 URL 查询参数和 user:password@(代理地址可能带凭据),并限制长度。
+// auth.go 的登录错误本身不包含响应体、账号或密码。
+func redactLoginError(err error) string {
+	msg := urlUserinfo.ReplaceAllString(err.Error(), "://")
+	msg = urlQuery.ReplaceAllString(msg, "")
+	msg = strings.Join(strings.Fields(msg), " ")
+	if r := []rune(msg); len(r) > 160 {
+		msg = string(r[:160]) + "…"
+	}
+	return msg
+}
+
 // isSessionError 判断错误是否由会话失效引起。
 func isSessionError(msg string) bool {
 	m := strings.ToLower(msg)
 	return strings.Contains(m, "401") || strings.Contains(m, "403") ||
 		strings.Contains(m, "session") || strings.Contains(m, "cookie") ||
 		strings.Contains(m, "unauthorized") || strings.Contains(m, "认证") ||
-		strings.Contains(m, "会话校验失败")
+		strings.Contains(m, "会话校验失败") || strings.Contains(m, "网页会话不可用")
 }
 
 // reloadConfig 重新加载 accounts.json 配置文件。

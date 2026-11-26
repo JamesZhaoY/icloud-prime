@@ -7,6 +7,7 @@ package account
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -31,7 +32,10 @@ type Account struct {
 	Host           string            `json:"host"`
 	Proxy          string            `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
 	AppPassword    string            `json:"app_password,omitempty"`
-	Status         string            `json:"status"` // active / error
+	Status         string            `json:"status"`                  // active / error
+	SessionToken   string            `json:"session_token,omitempty"` // 免密刷新会话用,敏感
+	TrustToken     string            `json:"trust_token,omitempty"`   // 免密刷新会话用,敏感
+	AccountCountry string            `json:"account_country,omitempty"`
 	AliasTotal     int               `json:"alias_total"`
 	AliasActive    int               `json:"alias_active"`
 	LastValidated  string            `json:"last_validated"`
@@ -47,7 +51,32 @@ type Manager struct {
 	accounts map[string]*Account
 	dataDir  string
 	dataFile string
+
+	// 网络资源缓存,与账号数据分开加锁,避免网络请求期间占用 mu。
+	cacheMu       sync.Mutex
+	sessions      map[string]sessionEntry
+	transports    map[string]transportEntry
+	pendingLogins map[string]pendingLogin
+	imapPool      *mail.Pool
 }
+
+// hmeSessionTTL 是缓存 /validate 结果的最长时间;过期后下次请求重新校验。
+const hmeSessionTTL = 30 * time.Minute
+
+type sessionEntry struct {
+	host    string
+	session hme.Session
+	expires time.Time
+}
+
+type transportEntry struct {
+	proxy     string
+	transport *hme.Transport
+}
+
+const statusReauthRequired = "reauth_required"
+
+var ErrHMEReauthRequired = errors.New("iCloud 网页会话不可用，请重新登录 Apple ID 或更新 Cookie")
 
 // NewManager 创建管理器。dataDir 用于存放 accounts.json。
 func NewManager(dataDir string) (*Manager, error) {
@@ -55,9 +84,13 @@ func NewManager(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		accounts: make(map[string]*Account),
-		dataDir:  dataDir,
-		dataFile: filepath.Join(dataDir, "accounts.json"),
+		accounts:      make(map[string]*Account),
+		dataDir:       dataDir,
+		dataFile:      filepath.Join(dataDir, "accounts.json"),
+		sessions:      make(map[string]sessionEntry),
+		transports:    make(map[string]transportEntry),
+		pendingLogins: make(map[string]pendingLogin),
+		imapPool:      mail.NewPool(),
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -69,7 +102,87 @@ func NewManager(dataDir string) (*Manager, error) {
 func (m *Manager) Reload() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.resetNetworkCaches()
 	return m.load()
+}
+
+// resetNetworkCaches 丢弃全部缓存的会话、HTTP 连接和空闲 IMAP 连接。
+func (m *Manager) resetNetworkCaches() {
+	m.cacheMu.Lock()
+	transports := m.transports
+	m.sessions = make(map[string]sessionEntry)
+	m.transports = make(map[string]transportEntry)
+	m.pendingLogins = make(map[string]pendingLogin)
+	m.cacheMu.Unlock()
+	for _, entry := range transports {
+		entry.transport.Close()
+	}
+	if m.imapPool != nil {
+		m.imapPool.CloseIdle()
+	}
+}
+
+// forgetAccountNetwork 丢弃单个账号缓存的会话和 HTTP 连接。
+func (m *Manager) forgetAccountNetwork(id string) {
+	m.cacheMu.Lock()
+	entry, hadTransport := m.transports[id]
+	delete(m.sessions, id)
+	delete(m.transports, id)
+	m.cacheMu.Unlock()
+	if hadTransport {
+		entry.transport.Close()
+	}
+}
+
+func (m *Manager) invalidateSession(id string) {
+	m.cacheMu.Lock()
+	delete(m.sessions, id)
+	m.cacheMu.Unlock()
+}
+
+func (m *Manager) cachedSession(id, host string) (hme.Session, bool) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	entry, ok := m.sessions[id]
+	if !ok || entry.host != host || time.Now().After(entry.expires) {
+		return hme.Session{}, false
+	}
+	return entry.session, true
+}
+
+func (m *Manager) storeSession(id, host string, session hme.Session) {
+	if session.ServiceURL == "" {
+		return
+	}
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.sessions == nil {
+		m.sessions = make(map[string]sessionEntry)
+	}
+	m.sessions[id] = sessionEntry{host: host, session: session, expires: time.Now().Add(hmeSessionTTL)}
+}
+
+// transportFor 返回账号专用的共享 HTTP 客户端;代理变化时重建。
+// 每个账号单独一个,避免不同账号的请求复用同一条 TLS 连接。
+func (m *Manager) transportFor(id, proxy string) (*hme.Transport, error) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.transports == nil {
+		m.transports = make(map[string]transportEntry)
+	}
+	if entry, ok := m.transports[id]; ok {
+		if entry.proxy == proxy {
+			return entry.transport, nil
+		}
+		entry.transport.Close()
+		delete(m.sessions, id)
+	}
+	transport, err := hme.NewTransport(proxy)
+	if err != nil {
+		return nil, err
+	}
+	m.transports[id] = transportEntry{proxy: proxy, transport: transport}
+	return transport, nil
 }
 
 func (m *Manager) load() error {
@@ -476,7 +589,20 @@ func (m *Manager) RemoveAccount(id string) (bool, error) {
 		m.accounts[id] = acc
 		return false, err
 	}
+	m.forgetAccountNetwork(id)
+	m.forgetIMAP(acc)
 	return true, nil
+}
+
+func (m *Manager) forgetIMAP(acc *Account) {
+	if m.imapPool == nil || acc == nil {
+		return
+	}
+	for _, email := range []string{acc.ICloudEmail, acc.RealEmail} {
+		if email != "" {
+			m.imapPool.Forget(email)
+		}
+	}
 }
 
 // GetAccount 返回账号副本。
@@ -507,12 +633,22 @@ func cloneAccount(acc *Account) *Account {
 // Public returns a detached account suitable for API responses.
 func (acc *Account) Public() *Account {
 	copy := *acc
-	copy.HasCookies = len(acc.Cookies) > 0
+	copy.HasCookies = acc.hasUsableCookies()
+	if !copy.HasCookies && (acc.LastValidated != "" || acc.Status == "active") {
+		copy.Status = statusReauthRequired
+		copy.LastError = ErrHMEReauthRequired.Error()
+	}
 	copy.HasAppPassword = acc.AppPassword != ""
 	copy.Cookies = nil
 	copy.AppPassword = ""
 	copy.Proxy = ""
+	copy.SessionToken = ""
+	copy.TrustToken = ""
 	return &copy
+}
+
+func (acc *Account) hasUsableCookies() bool {
+	return len(acc.Cookies) > 0 && acc.Status != statusReauthRequired
 }
 
 // Apply updates while locked, rolling back if persistence fails.
@@ -561,48 +697,156 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(acc.Cookies) == 0 {
-		return nil, fmt.Errorf("账号未配置 Cookie，无法使用 HME 功能")
+	if !acc.hasUsableCookies() {
+		return nil, ErrHMEReauthRequired
 	}
-	return hme.NewClient(acc.Cookies, acc.Host, acc.Proxy, verbose)
+	transport, err := m.transportFor(id, acc.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	client := hme.NewSessionClient(acc.Cookies, acc.Host, verbose, transport)
+	host := client.Host
+	if session, ok := m.cachedSession(id, host); ok {
+		client.UseSession(session)
+	}
+	client.OnValidated = func(session hme.Session) { m.storeSession(id, host, session) }
+	client.SetAccountCountry(acc.AccountCountry)
+	// 会话失效时,提供登录时存下的长期 token 供免密重建。
+	client.Reauth = func() (string, string, bool) {
+		cur, ok := m.GetAccount(id)
+		if !ok || cur.SessionToken == "" {
+			return "", "", false
+		}
+		return cur.SessionToken, cur.TrustToken, true
+	}
+	return client, nil
 }
 
-// HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
-// 登录成功后会自动获取 Cookie 并保存到账号配置。
-func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTPProvider) (*hme.Client, error) {
-	acc, ok := m.GetAccount(id)
-	if !ok {
-		return nil, fmt.Errorf("账号不存在: %s", id)
-	}
+// ErrLoginNeedsOTP 表示登录到了需要 2FA 的一步,验证码已推送到受信任设备,
+// 应调用 CompleteLoginOTP 在同一握手上提交验证码。
+var ErrLoginNeedsOTP = errors.New("请输入受信任 Apple 设备上的 6 位验证码")
 
+// ErrNoPendingLogin 表示没有待验证的登录会话(未开始、已过期或已用完)。
+var ErrNoPendingLogin = errors.New("登录会话已过期,请重新用密码登录")
+
+// pendingLoginTTL 是待验证登录会话的最长保留时间。
+const pendingLoginTTL = 5 * time.Minute
+
+type pendingLogin struct {
+	client  *hme.Client
+	expires time.Time
+}
+
+func (m *Manager) accountEmail(acc *Account) (string, error) {
 	email := acc.RealEmail
 	if email == "" {
 		email = acc.ICloudEmail
 	}
 	if email == "" {
-		return nil, fmt.Errorf("账号未设置邮箱地址")
+		return "", fmt.Errorf("账号未设置邮箱地址")
 	}
+	return email, nil
+}
 
+// BeginLogin 用密码发起登录。需要 2FA 时返回 ErrLoginNeedsOTP,并把握手会话暂存,
+// 等待随后的 CompleteLoginOTP 在**同一握手**上提交验证码。不需要 2FA 时直接完成。
+func (m *Manager) BeginLogin(id, password string) error {
+	acc, ok := m.GetAccount(id)
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	email, err := m.accountEmail(acc)
+	if err != nil {
+		return err
+	}
 	client, err := hme.NewClient(nil, acc.Host, acc.Proxy, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	if err := client.Login(email, password, otpProvider); err != nil {
-		return nil, err
+	needsOTP, err := client.LoginBegin(email, password)
+	if err != nil {
+		return err
 	}
+	if needsOTP {
+		m.stashPendingLogin(id, client)
+		return ErrLoginNeedsOTP
+	}
+	return m.saveLoggedInClient(id, client)
+}
 
-	// 保存登录后的 Cookie 到账号
+// CompleteLoginOTP 在 BeginLogin 暂存的握手上提交 2FA 验证码并完成登录。
+func (m *Manager) CompleteLoginOTP(id, code string) error {
+	client, ok := m.takePendingLogin(id)
+	if !ok {
+		return ErrNoPendingLogin
+	}
+	if err := client.CompleteOTP(code); err != nil {
+		if errors.Is(err, hme.ErrInvalidAppleCode) && client.NeedsOTP() {
+			// 验证码输错时握手仍有效,放回去让用户重填,而不是重新推送新验证码。
+			m.stashPendingLogin(id, client)
+		}
+		return err
+	}
+	return m.saveLoggedInClient(id, client)
+}
+
+// RequestLoginSMS 在 BeginLogin 暂存的握手上请求短信验证码,返回脱敏的手机号。
+// 握手保留(并重新计时),随后用 CompleteLoginOTP 提交短信里的验证码。
+func (m *Manager) RequestLoginSMS(id string) (string, error) {
+	client, ok := m.takePendingLogin(id)
+	if !ok {
+		return "", ErrNoPendingLogin
+	}
+	phone, err := client.RequestSMSCode()
+	if client.NeedsOTP() {
+		m.stashPendingLogin(id, client)
+	}
+	return phone, err
+}
+
+func (m *Manager) saveLoggedInClient(id string, client *hme.Client) error {
+	if len(client.Cookies) == 0 {
+		return ErrHMEReauthRequired
+	}
 	if err := m.updateAccount(id, func(current *Account) {
 		current.Cookies = cloneCookies(client.Cookies)
 		current.Status = "active"
 		current.LastError = ""
 		current.LastValidated = time.Now().Format(time.RFC3339)
+		if t := client.SessionToken(); t != "" {
+			current.SessionToken = t
+			current.TrustToken = client.TrustToken()
+			current.AccountCountry = client.AccountCountry()
+		}
 	}); err != nil {
-		return nil, err
+		return err
 	}
+	m.invalidateSession(id)
+	return nil
+}
 
-	return client, nil
+func (m *Manager) stashPendingLogin(id string, client *hme.Client) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.pendingLogins == nil {
+		m.pendingLogins = make(map[string]pendingLogin)
+	}
+	m.pendingLogins[id] = pendingLogin{client: client, expires: time.Now().Add(pendingLoginTTL)}
+}
+
+// takePendingLogin 取出并移除未过期的待验证登录会话(一次性)。
+func (m *Manager) takePendingLogin(id string) (*hme.Client, bool) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	entry, ok := m.pendingLogins[id]
+	if !ok {
+		return nil, false
+	}
+	delete(m.pendingLogins, id)
+	if time.Now().After(entry.expires) {
+		return nil, false
+	}
+	return entry.client, true
 }
 
 // MailClient 为指定账号创建 IMAP 邮件客户端。
@@ -622,7 +866,7 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	if acc.AppPassword == "" {
 		return nil, fmt.Errorf("账号未设置 App 专用密码")
 	}
-	return mail.NewClient(imapEmail, acc.AppPassword), nil
+	return mail.NewPooledClient(imapEmail, acc.AppPassword, m.imapPool), nil
 }
 
 // WebMailClient 为指定账号创建 Web 邮件客户端。
@@ -632,7 +876,7 @@ func (m *Manager) WebMailClient(id string) (*mail.WebClient, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(acc.Cookies) == 0 {
+	if !acc.hasUsableCookies() {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法读取邮件")
 	}
 	// 从 cookies 中获取 dsid
@@ -649,7 +893,7 @@ func (m *Manager) WebMailClient(id string) (*mail.WebClient, error) {
 
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
 func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
-	_, ok := m.GetAccount(id)
+	previous, ok := m.GetAccount(id)
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
@@ -678,6 +922,7 @@ func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 	if err != nil {
 		return err
 	}
+	m.forgetIMAP(previous)
 	_ = count
 	return nil
 }
@@ -692,16 +937,32 @@ func (m *Manager) SaveCookies(id string, cookies map[string]string) error {
 
 // Late network responses must not replace credentials saved by a newer request.
 func (m *Manager) SaveCookiesIfUnchanged(id string, before, after map[string]string) error {
+	return m.saveCookieResponse(id, before, after, false)
+}
+
+func (m *Manager) SaveHMEState(id string, before, after map[string]string, requestErr error) error {
+	return m.saveCookieResponse(id, before, after, hme.IsAuthenticationError(requestErr))
+}
+
+func (m *Manager) saveCookieResponse(id string, before, after map[string]string, rejected bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	acc, ok := m.accounts[id]
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	if !maps.Equal(acc.Cookies, before) || maps.Equal(before, after) {
+	if !maps.Equal(acc.Cookies, before) || acc.Status == statusReauthRequired || (!rejected && maps.Equal(before, after)) {
 		return nil
 	}
+	if rejected || len(after) == 0 {
+		m.invalidateSession(id)
+	}
 	return m.updateAccountLocked(id, func(acc *Account) {
+		if rejected || len(after) == 0 {
+			acc.Status = statusReauthRequired
+			acc.LastError = ErrHMEReauthRequired.Error()
+			return
+		}
 		acc.Cookies = cloneCookies(after)
 	})
 }
@@ -716,8 +977,6 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
 
-	// 自动校验 Cookie 是否有效
-	acc.Cookies = cloneCookies(cookies)
 	if acc.Host == "" {
 		acc.Host = "icloud.com"
 	}
@@ -726,32 +985,30 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		return err
 	}
 	if err := client.ValidateSession(); err != nil {
-		acc.Status = "error"
-		acc.LastError = "Cookie 校验失败: " + err.Error()
-	} else {
-		acc.Status = "active"
-		acc.LastValidated = time.Now().Format(time.RFC3339)
-		acc.LastError = ""
-		if info := client.AccountInfo(); info != nil {
-			acc.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
-			if acc.ICloudEmail == "" {
-				acc.ICloudEmail = deriveICloudEmail(info)
-			}
-		}
+		return fmt.Errorf("新 Cookie 校验失败，请从已登录的 iCloud 网页重新获取")
+	}
+	if len(client.Cookies) == 0 {
+		return ErrHMEReauthRequired
 	}
 
-	acc.Cookies = cloneCookies(client.Cookies)
-	return m.updateAccount(id, func(current *Account) {
-		current.Cookies = acc.Cookies
+	if err := m.updateAccount(id, func(current *Account) {
+		current.Cookies = cloneCookies(client.Cookies)
 		current.Host = acc.Host
-		current.Status = acc.Status
-		current.LastError = acc.LastError
-		current.LastValidated = acc.LastValidated
-		current.RealEmail = acc.RealEmail
-		if current.ICloudEmail == "" {
-			current.ICloudEmail = acc.ICloudEmail
+		current.Status = "active"
+		current.LastError = ""
+		current.LastValidated = time.Now().Format(time.RFC3339)
+		if info := client.AccountInfo(); info != nil {
+			current.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail, current.RealEmail)
+			if current.ICloudEmail == "" {
+				current.ICloudEmail = deriveICloudEmail(info)
+			}
 		}
-	})
+	}); err != nil {
+		return err
+	}
+	// 刚校验过新 Cookie,直接缓存这次的会话,下次请求无需再 /validate。
+	m.storeSession(id, client.Host, client.Session())
+	return nil
 }
 
 // ---- 辅助函数 ----

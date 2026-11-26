@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"icloud-hme/internal/hme"
 )
 
 const hourlyLimit = 5
@@ -355,12 +356,13 @@ func (s *Scheduler) runJob(ctx context.Context, id string, at time.Time) {
 	if err != nil {
 		s.limiter.Release(accountID, at, 1)
 		if isTransientCreateError(err) {
-			s.updateJob(id, at, func(job *Job) {
+			failedAt := s.now()
+			s.updateJob(id, failedAt, func(job *Job) {
 				if job.Status != StatusRunning {
 					return
 				}
 				job.LastError = err.Error()
-				job.NextRunAt = timePtr(nextHour(at))
+				job.NextRunAt = timePtr(nextHour(failedAt))
 			})
 			return
 		}
@@ -519,9 +521,16 @@ func isTransientCreateError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if hme.IsTemporaryAddressLimit(err) {
+		return true
+	}
+	// 认证失败(401/403/421)已尝试过免密刷新仍未成功,重试也不会好,
+	// 应停下来等待手动重新登录,而不是每小时再失败一次。
+	if hme.IsAuthenticationError(err) {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	transientMarkers := []string{
-		"http 421",
 		"http 429",
 		"http 500",
 		"http 502",
