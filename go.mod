@@ -9,7 +9,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
-	github.com/tidwall/gjson v1.19.0
+	github.com/tidwall/gjson v1.20.6
 	golang.org/x/crypto v0.53.0
 )
 
@@ -44,7 +44,7 @@ require (
 	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
 	github.com/tidwall/match v1.2.0 // indirect
-	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/tidwall/pretty v1.3.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.7.0 // indirect
